@@ -6,6 +6,8 @@ use App\Models\Category;
 use App\Models\Product;
 use App\Services\SlugGenerator;
 use App\Support\ImageRules;
+use App\Support\Money;
+use App\Support\ProductRules;
 use Filament\Forms\Components\FileUpload;
 use Filament\Forms\Components\Repeater;
 use Filament\Forms\Components\Select;
@@ -60,6 +62,18 @@ class ProductForm
                                 ->maxLength(64)
                                 ->unique(Product::class, 'sku', ignoreRecord: true)
                                 ->helperText(__('admin.hints.sku_unique')),
+
+                            TextInput::make('price')
+                                ->label(__('admin.fields.price'))
+                                ->numeric()
+                                ->minValue(0)
+                                ->maxValue(ProductRules::PRICE_MAX)
+                                ->step('0.01')
+                                ->prefix(Money::CURRENCY)
+                                // The same rules the ProductRequest applies,
+                                // so the panel and the request agree.
+                                ->rules(ProductRules::price())
+                                ->helperText(__('admin.hints.price')),
                         ]),
                     ]),
 

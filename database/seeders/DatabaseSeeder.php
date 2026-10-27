@@ -15,7 +15,7 @@ class DatabaseSeeder extends Seeder
      */
     public function run(): void
     {
-        $this->call(CatalogSeeder::class);
+        $this->call(RealisticCatalogSeeder::class);
 
         $this->command?->newLine();
         $this->command?->info('Catalog seeded. Create an administrator with: php artisan app:create-admin');

@@ -208,8 +208,8 @@ class ProductManagementTest extends TestCase
 
         $this->get('/en')->assertInertia(
             fn (AssertableInertia $page) => $page
-                ->has('featured', 1)
-                ->where('featured.0.id', $product->id)
+                ->has('featured.data', 1)
+                ->where('featured.data.0.id', $product->id)
         );
     }
 

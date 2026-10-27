@@ -50,6 +50,12 @@ const { t } = useTranslations();
                 {{ product.category.name }}
             </Link>
 
+            <!-- Rendered only when the server sent a price, so an unpriced
+                 product shows nothing rather than a misleading zero. -->
+            <p v-if="product.price" class="numeric text-sm font-semibold text-brand-800">
+                {{ product.price }}
+            </p>
+
             <Link
                 :href="product.url"
                 class="mt-auto pt-2 text-xs font-medium text-brand-700 hover:text-brand-900"

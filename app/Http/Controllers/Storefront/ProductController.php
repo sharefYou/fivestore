@@ -8,6 +8,7 @@ use App\Models\Category;
 use App\Models\Product;
 use App\Support\CatalogPresenter;
 use App\Support\CatalogUrls;
+use App\Support\Pagination;
 use App\Support\Seo;
 use Inertia\Response;
 
@@ -22,14 +23,19 @@ class ProductController extends Controller
             ? null
             : Category::query()->published()->slug($locale, $categorySlug)->first();
 
-        $products = Product::query()
-            ->published()
-            ->when($category !== null, fn ($query) => $query->where('category_id', $category->id))
-            ->search($term)
-            ->with(['primaryImage', 'category'])
-            ->ordered()
-            ->paginate(config('catalog.per_page.search_results'))
-            ->withQueryString();
+        $page = Pagination::pageNumber($request);
+
+        $products = Pagination::guardWithinRange(
+            Product::query()
+                ->published()
+                ->when($category !== null, fn ($query) => $query->where('category_id', $category->id))
+                ->search($term)
+                ->with(['primaryImage', 'category'])
+                ->ordered()
+                ->paginate(config('catalog.per_page.search_results'), page: $page)
+                // Keeps the search term and category filter on every page link.
+                ->withQueryString()
+        );
 
         $categories = Category::query()->published()->ordered()->get();
 
@@ -48,15 +54,7 @@ class ProductController extends Controller
                 'data' => collect($products->items())
                     ->map(fn (Product $product) => CatalogPresenter::productCard($product, $locale))
                     ->all(),
-                'meta' => [
-                    'current_page' => $products->currentPage(),
-                    'last_page' => $products->lastPage(),
-                    'from' => $products->firstItem(),
-                    'to' => $products->lastItem(),
-                    'total' => $products->total(),
-                    'prev_url' => $products->previousPageUrl(),
-                    'next_url' => $products->nextPageUrl(),
-                ],
+                'meta' => Pagination::meta($products),
             ],
             'links' => [
                 'self' => CatalogUrls::products($locale),

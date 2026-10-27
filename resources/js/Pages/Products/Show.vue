@@ -33,6 +33,10 @@ const { t } = useTranslations();
             <div>
                 <h1 class="text-2xl font-bold sm:text-3xl">{{ product.name }}</h1>
 
+                <p v-if="product.price" class="numeric mt-3 text-2xl font-bold text-brand-800">
+                    {{ product.price }}
+                </p>
+
                 <dl class="mt-4 flex flex-wrap items-center gap-x-6 gap-y-2 text-sm">
                     <div v-if="product.category" class="flex items-center gap-2">
                         <dt class="text-ink-muted">{{ t('products.category') }}:</dt>

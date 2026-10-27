@@ -34,11 +34,8 @@ return [
     'per_page' => [
         'category_products' => 12,
         'search_results' => 12,
-    ],
-
-    'home' => [
-        'featured_limit' => 8,
-        'latest_limit' => 8,
+        'home_featured' => 12,
+        'home_latest' => 12,
     ],
 
     /*

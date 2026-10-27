@@ -97,8 +97,8 @@ class PublishingRulesTest extends TestCase
             ->assertOk()
             ->assertInertia(fn (AssertableInertia $page) => $page
                 ->component('Home')
-                ->has('featured', 1)
-                ->where('featured.0.id', $featured->id)
+                ->has('featured.data', 1)
+                ->where('featured.data.0.id', $featured->id)
             );
     }
 

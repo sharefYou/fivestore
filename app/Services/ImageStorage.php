@@ -55,6 +55,44 @@ class ImageStorage
     }
 
     /**
+     * Persist an image that already sits on the local filesystem, applying
+     * exactly the same checks and naming as an upload.
+     *
+     * Used for images fetched from a remote source: by the time the bytes
+     * reach here they are an ordinary local file, and they earn no more trust
+     * than a file a browser sent.
+     *
+     * @param  'categories'|'products'|'site'  $bucket
+     */
+    public function storeFromPath(string $sourcePath, string $bucket): string
+    {
+        $directory = config("catalog.images.directories.{$bucket}");
+
+        if (! is_string($directory)) {
+            throw new RuntimeException("Unknown image bucket [{$bucket}].");
+        }
+
+        if (! $this->looksLikeAcceptedImage($sourcePath)) {
+            throw new RuntimeException('The file is not a supported image.');
+        }
+
+        $contents = @file_get_contents($sourcePath);
+
+        if ($contents === false) {
+            throw new RuntimeException('The image could not be read.');
+        }
+
+        // The remote filename is never used, exactly as with an upload.
+        $path = $directory.'/'.Str::uuid()->toString().'.'.$this->extensionFor($sourcePath);
+
+        if (! $this->disk()->put($path, $contents)) {
+            throw new RuntimeException('The image could not be stored.');
+        }
+
+        return $path;
+    }
+
+    /**
      * Remove a stored file, tolerating one that is already gone.
      */
     public function delete(?string $path): void

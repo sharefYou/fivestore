@@ -3,6 +3,7 @@
 namespace App\Filament\Resources\Products\Tables;
 
 use App\Models\Category;
+use App\Support\Money;
 use Filament\Actions\BulkActionGroup;
 use Filament\Actions\DeleteAction;
 use Filament\Actions\DeleteBulkAction;
@@ -48,6 +49,13 @@ class ProductsTable
                 TextColumn::make('sku')
                     ->label(__('admin.fields.sku'))
                     ->searchable()
+                    ->toggleable(),
+
+                TextColumn::make('price')
+                    ->label(__('admin.fields.price'))
+                    // An unpriced product shows a dash, never 0.00.
+                    ->formatStateUsing(fn (?string $state): string => Money::format($state) ?? '—')
+                    ->sortable()
                     ->toggleable(),
 
                 ToggleColumn::make('is_active')

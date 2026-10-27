@@ -23,7 +23,10 @@ class ProductSearchRequest extends FormRequest
         return [
             'q' => ['nullable', 'string', 'max:100'],
             'category' => ['nullable', 'string', 'max:180'],
-            'page' => ['nullable', 'integer', 'min:1', 'max:10000'],
+            // `page` is deliberately not validated here: App\Support\Pagination
+            // answers a malformed or out-of-range page with a 404, which is
+            // the right response for an address that does not exist, rather
+            // than a redirect carrying validation errors.
         ];
     }
 

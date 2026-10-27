@@ -8,6 +8,7 @@ use App\Models\Product;
 use App\Services\SiteSettings;
 use App\Support\CatalogPresenter;
 use App\Support\CatalogUrls;
+use App\Support\Pagination;
 use App\Support\Seo;
 use Inertia\Response;
 
@@ -24,20 +25,34 @@ class HomeController extends Controller
             ->withCount(['products' => fn ($query) => $query->where('is_active', true)])
             ->get();
 
-        $featured = Product::query()
-            ->published()
-            ->where('is_featured', true)
-            ->with(['primaryImage', 'category'])
-            ->ordered()
-            ->limit(config('catalog.home.featured_limit'))
-            ->get();
+        // Two listings share one page, so each carries its own page number.
+        // A single `page` would move both at once.
+        $featured = Pagination::guardWithinRange(
+            Product::query()
+                ->published()
+                ->where('is_featured', true)
+                ->with(['primaryImage', 'category'])
+                ->ordered()
+                ->paginate(
+                    config('catalog.per_page.home_featured'),
+                    pageName: 'featured',
+                    page: Pagination::pageNumber(request(), 'featured'),
+                )
+                ->withQueryString()
+        );
 
-        $latest = Product::query()
-            ->published()
-            ->with(['primaryImage', 'category'])
-            ->latest('created_at')
-            ->limit(config('catalog.home.latest_limit'))
-            ->get();
+        $latest = Pagination::guardWithinRange(
+            Product::query()
+                ->published()
+                ->with(['primaryImage', 'category'])
+                ->latest('created_at')
+                ->paginate(
+                    config('catalog.per_page.home_latest'),
+                    pageName: 'latest',
+                    page: Pagination::pageNumber(request(), 'latest'),
+                )
+                ->withQueryString()
+        );
 
         $siteName = $site->translate('site_name', $locale) ?? config('app.name');
 
@@ -49,12 +64,18 @@ class HomeController extends Controller
             'categories' => $categories
                 ->map(fn (Category $category) => CatalogPresenter::categoryCard($category, $locale))
                 ->all(),
-            'featured' => $featured
-                ->map(fn (Product $product) => CatalogPresenter::productCard($product, $locale))
-                ->all(),
-            'latest' => $latest
-                ->map(fn (Product $product) => CatalogPresenter::productCard($product, $locale))
-                ->all(),
+            'featured' => [
+                'data' => collect($featured->items())
+                    ->map(fn (Product $product) => CatalogPresenter::productCard($product, $locale))
+                    ->all(),
+                'meta' => Pagination::meta($featured),
+            ],
+            'latest' => [
+                'data' => collect($latest->items())
+                    ->map(fn (Product $product) => CatalogPresenter::productCard($product, $locale))
+                    ->all(),
+                'meta' => Pagination::meta($latest),
+            ],
             'links' => [
                 'categories' => CatalogUrls::categories($locale),
                 'products' => CatalogUrls::products($locale),

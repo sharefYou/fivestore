@@ -4,13 +4,19 @@ import CategoryCard from '@/components/CategoryCard.vue';
 import EmptyState from '@/components/EmptyState.vue';
 import ProductCard from '@/components/ProductCard.vue';
 import { useTranslations } from '@/composables/useTranslations';
-import type { CategoryCard as CategoryCardType, ProductCard as ProductCardType, SeoMeta } from '@/types';
+import PaginationNav from '@/components/PaginationNav.vue';
+import type {
+    CategoryCard as CategoryCardType,
+    Paginated,
+    ProductCard as ProductCardType,
+    SeoMeta,
+} from '@/types';
 
 defineProps<{
     hero: { title: string; subtitle: string };
     categories: CategoryCardType[];
-    featured: ProductCardType[];
-    latest: ProductCardType[];
+    featured: Paginated<ProductCardType>;
+    latest: Paginated<ProductCardType>;
     links: { categories: string; products: string };
     seo: SeoMeta;
 }>();
@@ -66,15 +72,17 @@ const { t } = useTranslations();
 
         <EmptyState v-else :title="t('categories.empty')" class="mt-4" />
 
-        <section v-if="featured.length" class="mt-14" aria-labelledby="home-featured">
+        <section v-if="featured.data.length" class="mt-14" aria-labelledby="home-featured">
             <h2 id="home-featured" class="text-xl font-semibold sm:text-2xl">{{ t('home.featured') }}</h2>
 
             <div class="mt-5 grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
-                <ProductCard v-for="product in featured" :key="product.id" :product="product" />
+                <ProductCard v-for="product in featured.data" :key="product.id" :product="product" />
             </div>
+
+            <PaginationNav :meta="featured.meta" />
         </section>
 
-        <section v-if="latest.length" class="mt-14" aria-labelledby="home-latest">
+        <section v-if="latest.data.length" class="mt-14" aria-labelledby="home-latest">
             <div class="flex items-end justify-between gap-4">
                 <h2 id="home-latest" class="text-xl font-semibold sm:text-2xl">{{ t('home.latest') }}</h2>
                 <Link :href="links.products" class="text-sm font-medium text-brand-700 hover:text-brand-900">
@@ -83,8 +91,10 @@ const { t } = useTranslations();
             </div>
 
             <div class="mt-5 grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
-                <ProductCard v-for="product in latest" :key="product.id" :product="product" />
+                <ProductCard v-for="product in latest.data" :key="product.id" :product="product" />
             </div>
+
+            <PaginationNav :meta="latest.meta" />
         </section>
     </div>
 </template>

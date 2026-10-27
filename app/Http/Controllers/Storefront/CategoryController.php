@@ -7,6 +7,7 @@ use App\Models\Category;
 use App\Models\Product;
 use App\Support\CatalogPresenter;
 use App\Support\CatalogUrls;
+use App\Support\Pagination;
 use App\Support\Seo;
 use Inertia\Response;
 
@@ -44,13 +45,19 @@ class CategoryController extends Controller
             ->slug($locale, $slug)
             ->firstOrFail();
 
-        $products = Product::query()
-            ->published()
-            ->where('category_id', $category->id)
-            ->with(['primaryImage'])
-            ->ordered()
-            ->paginate(config('catalog.per_page.category_products'))
-            ->withQueryString();
+        // A malformed page is rejected before the query runs; a page past the
+        // end is a 404 rather than a misleading empty category.
+        $page = Pagination::pageNumber(request());
+
+        $products = Pagination::guardWithinRange(
+            Product::query()
+                ->published()
+                ->where('category_id', $category->id)
+                ->with(['primaryImage'])
+                ->ordered()
+                ->paginate(config('catalog.per_page.category_products'), page: $page)
+                ->withQueryString()
+        );
 
         $name = $category->translate('name', $locale);
 
@@ -63,15 +70,7 @@ class CategoryController extends Controller
                 'data' => collect($products->items())
                     ->map(fn (Product $product) => CatalogPresenter::productCard($product, $locale))
                     ->all(),
-                'meta' => [
-                    'current_page' => $products->currentPage(),
-                    'last_page' => $products->lastPage(),
-                    'from' => $products->firstItem(),
-                    'to' => $products->lastItem(),
-                    'total' => $products->total(),
-                    'prev_url' => $products->previousPageUrl(),
-                    'next_url' => $products->nextPageUrl(),
-                ],
+                'meta' => Pagination::meta($products),
             ],
             'links' => [
                 'categories' => CatalogUrls::categories($locale),

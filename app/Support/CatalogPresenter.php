@@ -45,6 +45,10 @@ final class CatalogPresenter
             'name' => $product->translate('name', $locale),
             'url' => CatalogUrls::product($product, $locale),
             'is_featured' => $product->is_featured,
+            // Already formatted for the locale, and null when unpriced, so a
+            // page never has to decide how to render money or whether 0 is a
+            // price.
+            'price' => Money::format($product->price, $locale),
             'image' => self::image($image, $product, $locale),
             'category' => $product->relationLoaded('category') && $product->category !== null
                 ? [

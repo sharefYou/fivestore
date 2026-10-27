@@ -24,6 +24,7 @@ use Illuminate\Database\Eloquent\SoftDeletes;
  * @property string $slug_ar
  * @property string $slug_en
  * @property string|null $sku
+ * @property string|null $price
  * @property bool $is_active
  * @property bool $is_featured
  * @property int $sort_order
@@ -47,6 +48,7 @@ class Product extends Model
         'slug_ar',
         'slug_en',
         'sku',
+        'price',
         'is_active',
         'is_featured',
         'sort_order',
@@ -58,6 +60,7 @@ class Product extends Model
             'is_active' => 'boolean',
             'is_featured' => 'boolean',
             'sort_order' => 'integer',
+            'price' => 'decimal:2',
         ];
     }
 

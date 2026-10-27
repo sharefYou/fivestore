@@ -34,6 +34,7 @@ return [
         'sort_order' => 'Display order',
         'category' => 'Category',
         'sku' => 'SKU',
+        'price' => 'Price',
         'products_count' => 'Products',
         'updated_at' => 'Last updated',
         'created_at' => 'Created',
@@ -80,6 +81,7 @@ return [
         'product_is_active' => 'A product is public only when both it and its category are published.',
         'primary_image' => 'Exactly one image can be primary; it is the one shown in listings.',
         'sku_unique' => 'Optional, but must be unique when set.',
+        'price' => 'Optional. Leave empty for a product with no published price; 0 would read as free.',
     ],
 
     'validation' => [

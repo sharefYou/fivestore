@@ -95,7 +95,7 @@ class SmokeTest extends TestCase
 
         $this->get('/en')
             ->assertOk()
-            ->assertInertia(fn (AssertableInertia $page) => $page->has('featured', 0)->has('latest', 0));
+            ->assertInertia(fn (AssertableInertia $page) => $page->has('featured.data', 0)->has('latest.data', 0));
 
         $this->get('/en/categories/'.$category->slug_en)
             ->assertOk()

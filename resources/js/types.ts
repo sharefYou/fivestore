@@ -52,6 +52,8 @@ export interface ProductCard {
     name: string | null;
     url: string;
     is_featured: boolean;
+    /** Already formatted for the active locale, or null when unpriced. */
+    price: string | null;
     image: ImageData | null;
     category: { name: string | null; url: string } | null;
 }
