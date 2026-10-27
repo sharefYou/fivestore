@@ -111,93 +111,227 @@ php -r '$m=json_decode(file_get_contents("public/build/manifest.json"),true);
 
 Both numbers must be sane (entries > 0, missing = 0) before uploading.
 
+This is the **only** build in the deployment. Section 5 packs its output into
+the asset archive and deliberately keeps it out of the code archive, so the two
+cannot drift apart. Do not rebuild between creating the two archives.
+
 ---
 
-## 5. Upload the code
+## 5. Build the release archives and upload them
 
-Build one archive that excludes everything the server owns or generates:
+Nothing on the server is replaced in this section. The archives are built from
+**one** `npm run build`, verified locally, and parked in a staging directory.
+The site keeps serving the current release throughout.
+
+### 5.1 One build, two archives, one release id
+
+The code and the assets must come from the same build: a `manifest.json` that
+disagrees with the deployed JavaScript produces a site that loads nothing. Tie
+them together with a release id and build both archives in one pass:
 
 ```sh
-tar -czf /tmp/release.tar.gz \
+cd /path/to/five_store
+
+npm run build
+
+RELEASE="$(date +%Y%m%d-%H%M%S)-$(git rev-parse --short HEAD)"
+MANIFEST_HASH="$(sha256sum public/build/manifest.json | cut -c1-16)"
+echo "$RELEASE $MANIFEST_HASH"
+
+# Code archive — excludes public/build, which ships in the asset archive.
+tar -czf "/tmp/code-$RELEASE.tar.gz" \
   --exclude='./.git' --exclude='./.github' --exclude='./node_modules' \
   --exclude='./vendor' --exclude='./.env' --exclude='./tests' \
-  --exclude='./public/storage' --exclude='./storage/app/public' \
-  --exclude='./storage/app/private' --exclude='./storage/logs' \
-  --exclude='./storage/framework/cache/data' --exclude='./storage/framework/sessions' \
-  --exclude='./storage/framework/views' \
+  --exclude='./public/build' --exclude='./public/storage' \
+  --exclude='./storage/app/public' --exclude='./storage/app/private' \
+  --exclude='./storage/logs' --exclude='./storage/framework/cache/data' \
+  --exclude='./storage/framework/sessions' --exclude='./storage/framework/views' \
   --exclude='./.claude' --exclude='./.mcp.json' --exclude='./boost.json' \
   --exclude='./CLAUDE.md' --exclude='./AGENTS.md' \
   --exclude='./docs' --exclude='./.phpunit.result.cache' \
   --exclude='./tsconfig.tsbuildinfo' --exclude='./fivestore-security-fixes.patch' \
   --exclude='*.log' .
+
+# Asset archive — public/build and nothing else.
+tar -czf "/tmp/assets-$RELEASE.tar.gz" public/build
 ```
 
-Then **inspect the archive that was produced**, rather than trusting the
-command. Note the `$` anchors: an unanchored `\.env` also matches
-`.env.example`, which belongs in the release and would read as a false alarm.
+Both archives carry the same `$RELEASE` in their names. Keep
+`$MANIFEST_HASH` to hand; section 6 checks it again on the server.
+
+### 5.2 Verify the code archive
+
+Inspect what was produced, rather than trusting the command. Note the `$`
+anchors: an unanchored `\.env` also matches `.env.example`, which belongs in
+the release and would read as a false alarm.
 
 ```sh
+CODE="/tmp/code-$RELEASE.tar.gz"
+
 # Each of these must print 0.
-tar -tzf /tmp/release.tar.gz | grep -cE '^\./\.env$'
-tar -tzf /tmp/release.tar.gz | grep -cE '^\./(vendor|node_modules)/'
-tar -tzf /tmp/release.tar.gz | grep -cE '^\./(\.claude/|\.mcp\.json|boost\.json)'
-tar -tzf /tmp/release.tar.gz | grep -cE '^\./(CLAUDE|AGENTS)\.md$'
-tar -tzf /tmp/release.tar.gz | grep -cE '^\./(tests|docs|\.git)/'
-tar -tzf /tmp/release.tar.gz | grep -cE 'phpunit\.result\.cache|tsbuildinfo|security-fixes\.patch'
+tar -tzf "$CODE" | grep -cE '^\./\.env$'
+tar -tzf "$CODE" | grep -cE '^\./(vendor|node_modules)/'
+tar -tzf "$CODE" | grep -cE '^\./(\.claude/|\.mcp\.json|boost\.json)'
+tar -tzf "$CODE" | grep -cE '^\./(CLAUDE|AGENTS)\.md$'
+tar -tzf "$CODE" | grep -cE '^\./(tests|docs|\.git)/'
+tar -tzf "$CODE" | grep -cE 'phpunit\.result\.cache|tsbuildinfo|security-fixes\.patch'
+tar -tzf "$CODE" | grep -cE '^\./public/build/'        # assets must NOT be here
 
 # And these must be present.
-tar -tzf /tmp/release.tar.gz | grep -cE '^\./(artisan|composer\.json|composer\.lock)$'  # 3
-tar -tzf /tmp/release.tar.gz | grep -c '^\./app/'                                        # > 0
-tar -tzf /tmp/release.tar.gz | grep -cE '^\./public/build/manifest\.json$'               # 1
+tar -tzf "$CODE" | grep -cE '^\./(artisan|composer\.json|composer\.lock)$'   # 3
+tar -tzf "$CODE" | grep -c '^\./app/'                                        # > 0
+tar -tzf "$CODE" | grep -c '^\./database/migrations/'                        # > 0
 ```
 
-Run on this working tree, the archive came to **623 files, 3.0 MB**, with every
-"must be 0" check reading `0`.
+### 5.3 Verify the asset archive
 
-Upload only after every check above reads as expected:
+The manifest must be present, and every file it names must be in the archive —
+a manifest pointing at a chunk that was not packed is exactly the failure that
+leaves a blank page.
 
 ```sh
+ASSETS="/tmp/assets-$RELEASE.tar.gz"
 
-scp /tmp/release.tar.gz fivestore@ssh-fivestore.alwaysdata.net:/tmp/
+tar -tzf "$ASSETS" | grep -cE '^public/build/manifest\.json$'    # 1
+tar -tzf "$ASSETS" | grep -c '^public/build/assets/'             # > 0
+tar -tzf "$ASSETS" | grep -cvE '^public/build/'                  # 0 - nothing else
+
+# Every file referenced by the manifest is actually packed.
+tar -tzf "$ASSETS" > /tmp/packed.txt
+tar -xzOf "$ASSETS" public/build/manifest.json > /tmp/manifest.json
+
+php -r '
+$manifestPath = $argv[1]; $packedPath = $argv[2];
+$raw = @file_get_contents($manifestPath);
+if ($raw === false) { fwrite(STDERR, "FAIL: cannot read the manifest at $manifestPath\n"); exit(1); }
+$m = json_decode($raw, true);
+if (!is_array($m) || $m === []) { fwrite(STDERR, "FAIL: manifest did not decode, or is empty\n"); exit(1); }
+$want = [];
+foreach ($m as $e) { foreach (array_merge([$e["file"]], $e["css"] ?? []) as $f) { $want[$f] = true; } }
+if (count($want) === 0) { fwrite(STDERR, "FAIL: manifest references no files\n"); exit(1); }
+$lines = @file($packedPath);
+if ($lines === false) { fwrite(STDERR, "FAIL: cannot read the archive listing at $packedPath\n"); exit(1); }
+$have = [];
+foreach ($lines as $l) { $have[preg_replace("#^public/build/#", "", trim($l))] = true; }
+$missing = array_diff_key($want, $have);
+printf("referenced by manifest: %d, missing from archive: %d\n", count($want), count($missing));
+foreach (array_slice(array_keys($missing), 0, 5) as $f) { echo "  MISSING $f\n"; }
+exit(count($missing) === 0 ? 0 : 1);' /tmp/manifest.json /tmp/packed.txt
 ```
 
-On the server, extract over the existing tree. This replaces code only;
-`.env`, `storage/`, `vendor/` and `public/build` are untouched by the archive:
+The guards matter. An earlier version of this check read the manifest from a
+hard-coded path, and when that path did not resolve it reported
+`missing: 0` — a pass, from having compared nothing at all. Paths are passed as
+arguments now, and the script exits non-zero if the manifest cannot be read,
+does not decode, or references no files.
+
+### 5.4 Upload to a staging directory
+
+Uploading does not touch the running application. Put both archives somewhere
+outside the web root and leave them there until section 6.
 
 ```sh
-cd ~/five_store
-tar -xzf /tmp/release.tar.gz
-rm -f /tmp/release.tar.gz
+ssh fivestore@ssh-fivestore.alwaysdata.net 'mkdir -p ~/releases && chmod 700 ~/releases'
+scp "/tmp/code-$RELEASE.tar.gz" "/tmp/assets-$RELEASE.tar.gz" \
+    fivestore@ssh-fivestore.alwaysdata.net:~/releases/
+
+# Confirm both arrived intact.
+ssh fivestore@ssh-fivestore.alwaysdata.net "ls -lh ~/releases/*-$RELEASE.tar.gz && \
+  gzip -t ~/releases/code-$RELEASE.tar.gz && gzip -t ~/releases/assets-$RELEASE.tar.gz && echo 'both archives are readable'"
 ```
 
-Then upload the built assets separately:
+At this point the site is still serving the old release and nothing has been
+replaced. **Do not continue unless every check in 5.2 and 5.3 passed.**
 
-```sh
-# from your machine
-tar -czf /tmp/build.tar.gz public/build
-scp /tmp/build.tar.gz fivestore@ssh-fivestore.alwaysdata.net:/tmp/
-# on the server
-cd ~/five_store && rm -rf public/build && tar -xzf /tmp/build.tar.gz && rm -f /tmp/build.tar.gz
+### 5.5 Measured on this working tree
+
+Both archives were built and inspected with the commands above:
+
+```
+RELEASE        20261028-020910-a50c3185
+MANIFEST_HASH  5573e3afcf48d5a3
+
+code archive   541 files, 2.0 MB
+  .env / vendor / node_modules ............ 0
+  .claude / .mcp.json / boost.json ........ 0
+  CLAUDE.md / AGENTS.md ................... 0
+  tests/ docs/ .git/ ...................... 0
+  dev artifacts ........................... 0
+  public/build/ ........................... 0   <- assets excluded
+  artisan + composer.json + composer.lock . 3
+  app/ files .............................. 83
+  database/migrations/ .................... 10
+
+asset archive  82 files, 1.1 MB
+  manifest.json ........................... 1
+  assets/ files ........................... 80
+  anything outside public/build ........... 0
+  referenced by manifest .................. 79
+  missing from archive .................... 0
+
+pairing        manifest hash in archive == hash recorded at build time
 ```
 
 No `rsync --delete` anywhere: the remote tree is never pruned by this process.
 
 ---
 
-## 6. Dependencies, migration, caches
+## 6. The maintenance window
+
+Everything that changes the running site happens here, in this order. The
+window opens with `down` and closes with `up` — and `up` is only reached if
+the verification in section 8 passes.
+
+### 6.1 Take the site down, using the release that is still running
+
+```sh
+ssh fivestore@ssh-fivestore.alwaysdata.net
+cd ~/five_store
+php artisan down --retry=30
+```
+
+This is run **before** any file is replaced, so it is the current, working
+application that puts itself into maintenance. Running it after a partial swap
+would mean asking half-replaced code to do it.
+
+`down` writes `storage/framework/maintenance.php`, and `storage/` is never
+replaced by either archive, so maintenance stays active across the swap.
+
+Confirm from outside that visitors see the maintenance page:
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' https://fivestore.alwaysdata.net/   # expect 503
+```
+
+### 6.2 Replace the code and the assets
 
 ```sh
 cd ~/five_store
-php artisan down --retry=30          # brief maintenance window
+RELEASE=<the id from section 5>
 
+tar -xzf ~/releases/code-$RELEASE.tar.gz
+
+rm -rf public/build
+tar -xzf ~/releases/assets-$RELEASE.tar.gz      # restores public/build
+
+# The assets on disk must be the ones that were verified locally.
+sha256sum public/build/manifest.json | cut -c1-16     # must equal $MANIFEST_HASH
+```
+
+`.env`, `storage/` and `vendor/` are absent from both archives, so none of them
+is touched here.
+
+### 6.3 Dependencies, migration, caches
+
+```sh
+cd ~/five_store
 composer install --no-dev --optimize-autoloader
 
 php artisan migrate --force          # adds the nullable price column
+
 php artisan config:cache
 php artisan route:cache
 php artisan view:cache
-
-php artisan up
 ```
 
 The migration is additive: one nullable column, no data rewritten, no table
@@ -205,6 +339,45 @@ rebuilt beyond the `ALTER`. Existing products simply have `price = NULL` and
 the storefront shows no price for them, which is the intended behaviour.
 
 **Do not run `db:seed`.** See section 1.
+
+### 6.4 Verify before reopening
+
+Run section 7 (storage and permissions) and section 8 (verification), **while
+the site is still down**. The checks that need a browser can be run against the
+maintenance-bypass URL, or deferred to 6.5 and treated as blocking.
+
+```sh
+# The application itself answers correctly even while closed to visitors.
+php artisan about --only=environment
+php artisan tinker --execute="
+echo 'db       : '.DB::connection()->getDatabaseName().PHP_EOL;
+echo 'products : '.App\Models\Product::count().PHP_EOL;
+echo 'price col: '.(Schema::hasColumn('products','price') ? 'present' : 'MISSING').PHP_EOL;"
+```
+
+### 6.5 Reopen only on success
+
+```sh
+php artisan up
+curl -s -o /dev/null -w '%{http_code}\n' https://fivestore.alwaysdata.net/   # expect 302 to /ar or /en
+```
+
+Then immediately run the section 8a checklist against the live site.
+
+### 6.6 If anything fails
+
+**Leave the site in maintenance.** Do not run `php artisan up` to "see if it
+works" — a broken release serving real visitors is worse than a maintenance
+page.
+
+1. Capture the error (`storage/logs/laravel.log`, the failing command's output).
+2. Go to section 9 and restore the previous release.
+3. Re-run the verification in 6.4 against the restored release.
+4. Only then `php artisan up`.
+
+The previous release's archive is still in `~/releases`, and the pre-deploy
+backups are in `~/backups`, so going back does not depend on rebuilding
+anything.
 
 ---
 
@@ -339,11 +512,21 @@ catalog, record that it was deliberate.
 
 ## 9. Rollback
 
-If the site is broken after deployment:
+**The site stays in maintenance for all of this.** If the failure happened
+inside the window of section 6, it is already down — leave it down. If it
+surfaced after `php artisan up`, close the site again before touching
+anything, so visitors are not served a broken release while it is repaired.
+
+```sh
+cd ~/five_store
+php artisan down --retry=30 2>/dev/null || true
+curl -s -o /dev/null -w '%{http_code}\n' https://fivestore.alwaysdata.net/   # expect 503
+```
+
+Then restore the previous release:
 
 ```sh
 cd ~
-php ~/five_store/artisan down 2>/dev/null || true
 
 # 1. Code back to the previous release
 rm -rf ~/five_store_broken && mv ~/five_store ~/five_store_broken
@@ -357,7 +540,15 @@ cp -a ~/five_store_broken/vendor ~/five_store/vendor 2>/dev/null || \
 
 cd ~/five_store
 php artisan config:cache && php artisan route:cache && php artisan view:cache
+```
+
+Now verify the restored release **while it is still closed** — repeat the
+checks in section 6.4, and confirm the catalog counts match the pre-deploy
+backup. Only once that passes:
+
+```sh
 php artisan up
+curl -s -o /dev/null -w '%{http_code}\n' https://fivestore.alwaysdata.net/   # expect 302
 ```
 
 ### 9.1 Rolling back the price migration destroys every price
