@@ -36,8 +36,11 @@ Run from your machine:
 php artisan test
 ./vendor/bin/pint --test
 npm run type-check
-npm run build        # assets are built here: the server cannot (section 4)
 ```
+
+No build here. `npm run build` runs exactly once, in section 5.1, so the code
+archive and the asset archive are packed from the same output. Building twice
+is how a `manifest.json` ends up describing files that were never shipped.
 
 Then on the server, confirm the database accepts the new column shape before
 the migration runs for real. This touches a temporary table only:
@@ -62,21 +65,54 @@ validation, which already enforces the same rule.
 
 ## 3. Backups — mandatory, before the migration
 
+### 3.1 Database credentials for this session
+
+Several later steps need to reach the database without putting a password on a
+command line, where it would land in shell history and in the process list.
+Write them once, to a file only the account can read:
+
 ```sh
 ssh fivestore@ssh-fivestore.alwaysdata.net
+cd ~
+umask 077
+
+php -r '
+$e=[]; foreach(file("/home/fivestore/five_store/.env",FILE_IGNORE_NEW_LINES|FILE_SKIP_EMPTY_LINES) as $l){
+  if(str_starts_with($l,"#")||!str_contains($l,"="))continue; [$k,$v]=explode("=",$l,2); $e[$k]=trim($v,"\"\x27");}
+file_put_contents("/tmp/.dbcnf","[client]\nhost=".$e["DB_HOST"]."\nport=".$e["DB_PORT"]."\nuser=".$e["DB_USERNAME"]."\npassword=\"".$e["DB_PASSWORD"]."\"\n");
+chmod("/tmp/.dbcnf",0600); echo $e["DB_DATABASE"];' > /tmp/dbname
+chmod 600 /tmp/dbname
+
+ls -l /tmp/.dbcnf /tmp/dbname      # both must show -rw-------
+```
+
+**These two files stay in place for the whole deployment.** They are used by:
+
+| Section | Use |
+| --- | --- |
+| 3.2 | taking the database backup |
+| 3.3 | verifying that backup restores |
+| 8a | comparing row counts after the deploy |
+| 9.3 | exporting prices before a rollback |
+| 9.4 | restoring prices from that export |
+| 9.6 | verifying any backup is restorable |
+
+They are removed in **section 12**, once everything that needs them is done.
+Do not delete them earlier; an earlier draft of this plan removed them at the
+end of 3.2, which left every check above with no way to reach the database.
+
+If a rollback happens in a later session, re-run the block above first.
+
+### 3.2 Take the backups
+
+```sh
 cd ~
 mkdir -p backups && chmod 700 backups
 STAMP=$(date +%Y%m%d-%H%M%S)
 
-# Database. Credentials come from .env; never put them on the command line.
-php -r '
-$e=[]; foreach(file("/home/fivestore/five_store/.env",FILE_IGNORE_NEW_LINES|FILE_SKIP_EMPTY_LINES) as $l){
-  if(str_starts_with($l,"#")||!str_contains($l,"="))continue; [$k,$v]=explode("=",$l,2); $e[$k]=trim($v,"\"\x27");}
-file_put_contents("/tmp/.dbcnf","[client]\nhost=".$e["DB_HOST"]."\nuser=".$e["DB_USERNAME"]."\npassword=\"".$e["DB_PASSWORD"]."\"\n");
-chmod("/tmp/.dbcnf",0600); echo $e["DB_DATABASE"];' > /tmp/dbname
+# Database.
 mysqldump --defaults-extra-file=/tmp/.dbcnf --single-transaction \
   --default-character-set=utf8mb4 "$(cat /tmp/dbname)" > ~/backups/pre-price-$STAMP.sql
-rm -f /tmp/.dbcnf /tmp/dbname
 chmod 600 ~/backups/pre-price-$STAMP.sql
 
 # Uploaded images and the current application files.
@@ -87,33 +123,38 @@ tar -czf ~/backups/app-$STAMP.tar.gz --exclude=vendor --exclude=node_modules \
 ls -lh ~/backups
 ```
 
-Check each file is non-empty and the SQL dump ends with `-- Dump completed`:
+Keep `$STAMP` for the rest of the deployment; sections 6 and 9 refer to these
+filenames.
+
+### 3.3 Prove the backups are usable
+
+Each file must be non-empty, and the SQL dump must carry the trailer that
+`mysqldump` writes only on success:
 
 ```sh
-tail -1 ~/backups/pre-price-$STAMP.sql
+tail -1 ~/backups/pre-price-$STAMP.sql     # expect "-- Dump completed"
+gzip -t ~/backups/storage-$STAMP.tar.gz && echo "storage archive readable"
+gzip -t ~/backups/app-$STAMP.tar.gz && echo "app archive readable"
 ```
 
-Do not proceed without all three.
+Then run the full restore check in **section 9.6** against
+`~/backups/pre-price-$STAMP.sql`. It loads the dump into a scratch database and
+compares row counts table by table. A backup that has never been read back is
+an assumption, not a backup.
 
+Do not proceed without all three files, the trailer, and a clean 9.6 result.
 ---
 
-## 4. Build the assets locally
+## 4. Why the assets are built locally
 
 `vite build` dies on the server with a bus error (node + esbuild on NFS-backed
-shared storage), so assets are built on your machine and uploaded:
+shared storage), so the front-end assets are built on your machine and shipped
+with the release.
 
-```sh
-npm run build
-php -r '$m=json_decode(file_get_contents("public/build/manifest.json"),true);
- $miss=0; foreach($m as $e){foreach(array_merge([$e["file"]],$e["css"]??[]) as $f){ if(!is_file("public/build/".$f)) $miss++; }}
- echo "entries: ".count($m).", missing: ".$miss.PHP_EOL;'
-```
-
-Both numbers must be sane (entries > 0, missing = 0) before uploading.
-
-This is the **only** build in the deployment. Section 5 packs its output into
-the asset archive and deliberately keeps it out of the code archive, so the two
-cannot drift apart. Do not rebuild between creating the two archives.
+**The build itself is not run here.** It happens exactly once, in section 5.1,
+immediately before the two archives are packed from its output — so the code
+and the assets can never come from different builds. There is no `npm run
+build` anywhere else in this plan.
 
 ---
 
@@ -132,7 +173,14 @@ them together with a release id and build both archives in one pass:
 ```sh
 cd /path/to/five_store
 
+# The one and only build of this deployment.
 npm run build
+
+# Sanity-check its output before anything is packed from it.
+php -r '$m=json_decode(file_get_contents("public/build/manifest.json"),true);
+ $miss=0; foreach($m as $e){foreach(array_merge([$e["file"]],$e["css"]??[]) as $f){ if(!is_file("public/build/".$f)) $miss++; }}
+ echo "entries: ".count($m).", missing: ".$miss.PHP_EOL;'
+# entries must be > 0 and missing must be 0.
 
 RELEASE="$(date +%Y%m%d-%H%M%S)-$(git rev-parse --short HEAD)"
 MANIFEST_HASH="$(sha256sum public/build/manifest.json | cut -c1-16)"
@@ -512,10 +560,9 @@ catalog, record that it was deliberate.
 
 ## 9. Rollback
 
-**The site stays in maintenance for all of this.** If the failure happened
-inside the window of section 6, it is already down — leave it down. If it
-surfaced after `php artisan up`, close the site again before touching
-anything, so visitors are not served a broken release while it is repaired.
+**The site stays closed for all of this.** If the failure happened inside the
+window of section 6, it is already down — leave it down. If it surfaced after
+`php artisan up`, close the site again before touching anything.
 
 ```sh
 cd ~/five_store
@@ -523,32 +570,115 @@ php artisan down --retry=30 2>/dev/null || true
 curl -s -o /dev/null -w '%{http_code}\n' https://fivestore.alwaysdata.net/   # expect 503
 ```
 
-Then restore the previous release:
+### 9.0 Restore the previous release without reopening the site
+
+`php artisan down` works by writing `storage/framework/maintenance.php` **inside
+the application directory**. Moving that directory aside takes the flag with
+it, and the backup from section 3.2 was taken before the window opened, so it
+does not contain one. Restoring straight over the live path therefore reopens
+the site the instant the files land — before the caches are rebuilt and before
+anything has been verified.
+
+So the restored tree is assembled **outside** the live path, put into
+maintenance there, and only then swapped in:
 
 ```sh
 cd ~
+RESTORE=~/five_store_restore
+rm -rf "$RESTORE" && mkdir "$RESTORE"
 
-# 1. Code back to the previous release
-rm -rf ~/five_store_broken && mv ~/five_store ~/five_store_broken
-tar -xzf ~/backups/app-$STAMP.tar.gz -C ~
-cp -a ~/five_store_broken/.env ~/five_store/.env
-cp -a ~/five_store_broken/vendor ~/five_store/vendor 2>/dev/null || \
-  (cd ~/five_store && composer install --no-dev --optimize-autoloader)
+# 1. Unpack the previous release next to the live one, not over it.
+tar -xzf ~/backups/app-$STAMP.tar.gz -C "$RESTORE" --strip-components=1
 
-# 2. Images, only if they were lost
-#    tar -xzf ~/backups/storage-$STAMP.tar.gz -C ~/five_store
+# 2. Carry over the things the backup deliberately leaves out.
+cp -a ~/five_store/.env "$RESTORE/.env"
+cp -a ~/five_store/vendor "$RESTORE/vendor" 2>/dev/null || \
+  (cd "$RESTORE" && composer install --no-dev --optimize-autoloader)
 
+#    Uploaded images are excluded from app-*.tar.gz on purpose; without this
+#    step every product photograph would disappear with the rollback.
+mkdir -p "$RESTORE/storage/app/public"
+cp -a ~/five_store/storage/app/public/. "$RESTORE/storage/app/public/"
+
+# 3. Close the restored tree BEFORE it becomes the live one.
+(cd "$RESTORE" && php artisan down --retry=30)
+test -f "$RESTORE/storage/framework/maintenance.php" && echo "restored tree is closed"
+
+# 4. Swap. The maintenance flag travels with it, so the site never reopens.
+rm -rf ~/five_store_broken
+mv ~/five_store ~/five_store_broken
+mv "$RESTORE" ~/five_store
+
+cd ~/five_store
+test -f storage/framework/maintenance.php && echo "still closed after the swap"
+ls -l public/storage >/dev/null 2>&1 || php artisan storage:link
+```
+
+If images were lost rather than merely stale, restore them from their own
+backup instead of step 2's copy:
+
+```sh
+tar -xzf ~/backups/storage-$STAMP.tar.gz -C ~/five_store
+```
+
+### 9.0.1 Rebuild caches, verify, and only then reopen
+
+```sh
 cd ~/five_store
 php artisan config:cache && php artisan route:cache && php artisan view:cache
 ```
 
-Now verify the restored release **while it is still closed** — repeat the
-checks in section 6.4, and confirm the catalog counts match the pre-deploy
-backup. Only once that passes:
+Run the checks in section 6.4 **while the site is still closed**, and confirm
+the catalog counts match the pre-deploy backup:
+
+```sh
+php artisan tinker --execute="
+echo 'categories : '.App\Models\Category::count().PHP_EOL;
+echo 'products   : '.App\Models\Product::count().PHP_EOL;
+echo 'images     : '.App\Models\ProductImage::count().PHP_EOL;
+echo 'image files: '.count(Storage::disk(config('catalog.images.disk'))->allFiles('products')).PHP_EOL;"
+```
+
+Only once those pass:
 
 ```sh
 php artisan up
 curl -s -o /dev/null -w '%{http_code}\n' https://fivestore.alwaysdata.net/   # expect 302
+```
+
+Keep `~/five_store_broken` until the restored site has been checked properly;
+it holds the logs that explain what went wrong.
+
+### 9.0.2 Tested
+
+The whole sequence was run in an isolated copy of the application, with the
+real `artisan` binary and a section-3-style backup taken before `down`:
+
+```
+backup archive contains maintenance.php      : 0   (expected - taken before the window)
+
+OLD sequence (restore straight over the live path):
+  mv five_store five_store_broken
+  tar -xzf backup-app.tar.gz
+  -> maintenance.php in restored tree        : *** MISSING ***
+  -> app reports                             : "absent -> site is LIVE to visitors"
+  -> the flag was still in the moved-aside tree
+
+NEW sequence (assemble outside, close, then swap):
+  extracted 503 files into five_store_restore
+  carried over .env, vendor, storage/app/public
+  artisan down on the restored tree
+  swapped into place
+  -> maintenance.php in live tree            : PRESENT
+  -> app reports                             : "DOWN (visitors see maintenance)"
+  -> artisan up                              : "LIVE (reopened)"
+
+Image carry-over, checked separately:
+  images in live tree                        : 3
+  storage/app/public entries in the backup   : 0   (excluded on purpose)
+  restored tree before carry-over            : 0
+  restored tree after carry-over             : 3
+  contents identical                         : yes
 ```
 
 ### 9.1 Rolling back the price migration destroys every price
@@ -803,3 +933,39 @@ deployment must not proceed until a good one exists.
   "install Laravel Boost" bootstrap, which was stale and sent agents in a
   loop. It now points at `CLAUDE.md` and lists the project rules that must not
   be broken.
+
+---
+
+## 12. Close out
+
+Run this **last**, once the deployment has succeeded and section 8a has been
+ticked off — or, if the deployment was rolled back, once section 9 is complete
+and the restored site has been verified.
+
+```sh
+ssh fivestore@ssh-fivestore.alwaysdata.net
+
+# 1. Remove the database credentials written in section 3.1.
+shred -u /tmp/.dbcnf /tmp/dbname 2>/dev/null || rm -f /tmp/.dbcnf /tmp/dbname
+ls -l /tmp/.dbcnf /tmp/dbname 2>&1 | head -2      # expect "No such file"
+
+# 2. Remove the uploaded release archives, keeping the previous release for
+#    one cycle so a rollback does not depend on rebuilding anything.
+ls -lh ~/releases
+#    rm -f ~/releases/code-<older-release>.tar.gz ~/releases/assets-<older-release>.tar.gz
+
+# 3. Confirm no stray scratch databases were left behind.
+#    (needs the credentials, so run it BEFORE step 1 if you want to check)
+#    mysql --defaults-extra-file=/tmp/.dbcnf -e "SHOW DATABASES LIKE 'fivestore_%';"
+
+# 4. Confirm no working copies of the application are left in the home
+#    directory beyond the live one and, at most, one previous release.
+ls -ld ~/five_store*
+```
+
+Backups in `~/backups` are **not** removed here. They stay until the retention
+policy says otherwise, and `prices-*.tsv` in particular is the only artifact
+that can recover prices after a rollback (section 9.3).
+
+If a rollback becomes necessary in a later session, re-create the credentials
+with the block in section 3.1 before running anything in section 9.
