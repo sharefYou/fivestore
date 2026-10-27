@@ -1,2 +1,8 @@
 User-agent: *
-Disallow:
+Disallow: /admin
+Disallow: /livewire
+
+# Crawling rules are a hint, never a protection: the admin panel is closed by
+# authentication and authorisation, not by this file.
+
+Sitemap: /sitemap.xml
