@@ -126,11 +126,37 @@ tar -czf /tmp/release.tar.gz \
   --exclude='./storage/framework/cache/data' --exclude='./storage/framework/sessions' \
   --exclude='./storage/framework/views' \
   --exclude='./.claude' --exclude='./.mcp.json' --exclude='./boost.json' \
-  --exclude='./docs' --exclude='*.log' .
+  --exclude='./CLAUDE.md' --exclude='./AGENTS.md' \
+  --exclude='./docs' --exclude='./.phpunit.result.cache' \
+  --exclude='./tsconfig.tsbuildinfo' --exclude='./fivestore-security-fixes.patch' \
+  --exclude='*.log' .
+```
 
-# Confirm nothing sensitive, bulky or developer-only slipped in.
-tar -tzf /tmp/release.tar.gz | grep -cE '^\./(\.env|vendor|node_modules)'        # must print 0
-tar -tzf /tmp/release.tar.gz | grep -cE '^\./(\.claude|\.mcp\.json|boost\.json)' # must print 0
+Then **inspect the archive that was produced**, rather than trusting the
+command. Note the `$` anchors: an unanchored `\.env` also matches
+`.env.example`, which belongs in the release and would read as a false alarm.
+
+```sh
+# Each of these must print 0.
+tar -tzf /tmp/release.tar.gz | grep -cE '^\./\.env$'
+tar -tzf /tmp/release.tar.gz | grep -cE '^\./(vendor|node_modules)/'
+tar -tzf /tmp/release.tar.gz | grep -cE '^\./(\.claude/|\.mcp\.json|boost\.json)'
+tar -tzf /tmp/release.tar.gz | grep -cE '^\./(CLAUDE|AGENTS)\.md$'
+tar -tzf /tmp/release.tar.gz | grep -cE '^\./(tests|docs|\.git)/'
+tar -tzf /tmp/release.tar.gz | grep -cE 'phpunit\.result\.cache|tsbuildinfo|security-fixes\.patch'
+
+# And these must be present.
+tar -tzf /tmp/release.tar.gz | grep -cE '^\./(artisan|composer\.json|composer\.lock)$'  # 3
+tar -tzf /tmp/release.tar.gz | grep -c '^\./app/'                                        # > 0
+tar -tzf /tmp/release.tar.gz | grep -cE '^\./public/build/manifest\.json$'               # 1
+```
+
+Run on this working tree, the archive came to **623 files, 3.0 MB**, with every
+"must be 0" check reading `0`.
+
+Upload only after every check above reads as expected:
+
+```sh
 
 scp /tmp/release.tar.gz fivestore@ssh-fivestore.alwaysdata.net:/tmp/
 ```
@@ -336,74 +362,190 @@ php artisan up
 
 ### 9.1 Rolling back the price migration destroys every price
 
-This was tested on a copy of the real catalog (320 priced products), not
-assumed. `down()` drops the column, and dropping a column deletes its data:
+`down()` drops the column, and dropping a column deletes its data. Tested on a
+copy of the real catalog (320 priced products), not assumed:
 
 ```
-before rollback : 320 products with a price, sum 139780.00, FUR-1002 = 2850.00
-after  rollback : column `price` no longer exists
+before rollback           : 320 products with a price, sum 139780.00, FUR-1002 = 2850.00
+after  rollback           : column `price` no longer exists
 after  re-running migrate : 0 products with a price, sum 0
 ```
 
 **Re-applying the migration does not bring the prices back.** It recreates an
-empty column. So once real prices have been entered through `/admin`, a
-rollback is a data-loss event and must be treated as one.
+empty column.
 
-**Prefer not to roll this migration back at all.** The column is nullable and
-additive: older code simply ignores it, so reverting *code* does not require
-reverting the *schema*. Roll back the schema only if the column itself is the
-problem.
+> **The backup from section 3 cannot restore prices.**
+> It is taken *before* the migration runs, so its `products` table has no
+> `price` column at all. It is the right artifact for restoring the catalog as
+> it stood before this release, and it is useless for recovering prices entered
+> afterwards. Any procedure that claims otherwise is wrong.
 
-### 9.2 Restoring prices after a rollback — tested procedure
+That splits a rollback into two different situations:
 
-Do not restore the whole database; that would discard every order of business
-done since the backup. Restore the one column, from the backup taken in
-section 3. This exact sequence was run and verified:
+| When the rollback happens | What the prices are worth | What is needed |
+| --- | --- | --- |
+| Immediately after deploy, before anyone enters a price | Nothing is lost — there are no prices yet | Section 3's backup is sufficient |
+| Any time after real prices have been entered | Every price is destroyed | A **fresh export taken at rollback time** (section 9.3) |
+
+### 9.2 Prefer a forward fix
+
+The column is nullable and additive: older code ignores it, so **reverting the
+code does not require reverting the schema.** Rolling back is almost never the
+right answer.
+
+| Problem | Forward fix (preferred) | Rolling back |
+| --- | --- | --- |
+| Prices display wrongly | Change `App\Support\Money` or the Vue component and redeploy | Destroys data over a presentation bug |
+| Precision or range is wrong | New migration: `$table->decimal('price', 12, 2)->nullable()->change();` | Destroys data |
+| `UNSIGNED` rejected by the database | New migration dropping only the unsigned attribute; `min:0` validation already enforces the same rule | Destroys data |
+| A price was entered incorrectly | Fix it in `/admin` | Destroys every other price too |
+| The feature must be withdrawn | Deploy the previous code and **leave the column in place**, unused and ignored | Destroys data for no gain |
+
+Roll the schema back only when the column itself is the problem and no forward
+migration can address it.
+
+### 9.3 If the column really must go: export the prices first
+
+**Mandatory before any rollback.** This export is what makes recovery possible;
+section 3's backup will not do it.
 
 ```sh
-# 1. Load the backup into a SCRATCH database. Never import over the live one.
+cd ~/five_store
+STAMP=$(date +%Y%m%d-%H%M%S)
+
+# Rebuild the credentials file and database name as in section 3 if needed.
+mysql --defaults-extra-file=/tmp/.dbcnf -N -B \
+  -e "SELECT id, COALESCE(sku,''), price FROM products WHERE price IS NOT NULL" \
+  "$(cat /tmp/dbname)" > ~/backups/prices-$STAMP.tsv
+chmod 600 ~/backups/prices-$STAMP.tsv
+
+# Verify the export before trusting it.
+wc -l < ~/backups/prices-$STAMP.tsv
+awk -F'\t' '{s+=$3} END {printf "%.2f\n", s}' ~/backups/prices-$STAMP.tsv
+
+php artisan tinker --execute="
+echo 'live rows: '.App\Models\Product::whereNotNull('price')->count().PHP_EOL;
+echo 'live sum : '.App\Models\Product::sum('price').PHP_EOL;"
+```
+
+The exported row count and sum **must match** the live figures. If they do not,
+stop: the export is incomplete and the rollback would destroy prices that
+cannot be recovered.
+
+Only then:
+
+```sh
+php artisan migrate:rollback --step=1 --force
+```
+
+### 9.4 Restoring prices from the export
+
+```sh
+cd ~/five_store
+php artisan migrate --force          # recreates the column, empty
+
+# Targeted UPDATEs: only the price column is written, nothing else is touched.
+awk -F'\t' '{printf "UPDATE products SET price=%s WHERE id=%s;\n", $3, $1}' \
+  ~/backups/prices-$STAMP.tsv > /tmp/restore-prices.sql
+wc -l < /tmp/restore-prices.sql      # must equal the exported row count
+
+mysql --defaults-extra-file=/tmp/.dbcnf "$(cat /tmp/dbname)" < /tmp/restore-prices.sql
+rm -f /tmp/restore-prices.sql
+
+php artisan tinker --execute="
+echo 'restored rows: '.App\Models\Product::whereNotNull('price')->count().PHP_EOL;
+echo 'restored sum : '.App\Models\Product::sum('price').PHP_EOL;"
+```
+
+Both numbers must equal what section 9.3 recorded. A count of 0 means nothing
+matched — read the next paragraph before re-running anything.
+
+**If product rows were recreated in between**, their ids will have changed and
+an id match silently updates nothing. Match on the SKU instead, which is
+unique:
+
+```sh
+awk -F'\t' '$2 != "" {printf "UPDATE products SET price=%s WHERE sku='"'"'%s'"'"';\n", $3, $2}' \
+  ~/backups/prices-$STAMP.tsv > /tmp/restore-prices.sql
+```
+
+**If the only artifact is a full dump taken after prices existed** — a
+scheduled backup, not section 3's — the same copy-one-column approach works.
+This path was tested end to end:
+
+```sh
 mysql --defaults-extra-file=/tmp/.dbcnf -e \
   "DROP DATABASE IF EXISTS fivestore_restore; CREATE DATABASE fivestore_restore CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-mysql --defaults-extra-file=/tmp/.dbcnf fivestore_restore < ~/backups/pre-price-$STAMP.sql
+mysql --defaults-extra-file=/tmp/.dbcnf fivestore_restore < <dump-containing-prices>.sql
 
-# 2. Sanity-check what the backup holds before touching live data.
+# Check what the dump holds before touching live data.
 mysql --defaults-extra-file=/tmp/.dbcnf -e \
   "SELECT COUNT(*) AS products, SUM(price) AS price_sum FROM fivestore_restore.products;"
 
-# 3. Re-apply the schema if it was rolled back, then copy ONLY the price column.
-cd ~/five_store && php artisan migrate --force
+# Copy across the one column, then verify and clean up.
 mysql --defaults-extra-file=/tmp/.dbcnf -e \
-  "UPDATE fivestore_store.products p
-     JOIN fivestore_restore.products r ON p.id = r.id
-      SET p.price = r.price;"
-
-# 4. Verify the figures match the backup exactly.
-mysql --defaults-extra-file=/tmp/.dbcnf -e \
-  "SELECT COUNT(*) AS with_price, SUM(price) AS price_sum FROM fivestore_store.products WHERE price IS NOT NULL;"
-
-# 5. Remove the scratch database.
+  "UPDATE <live_db>.products p JOIN fivestore_restore.products r ON p.id = r.id SET p.price = r.price;"
 mysql --defaults-extra-file=/tmp/.dbcnf -e "DROP DATABASE fivestore_restore;"
-rm -f /tmp/.dbcnf
 ```
 
-Replace `fivestore_store` with the real database name from `.env`
-(`DB_DATABASE`). The verification in step 4 must return the same count and sum
-as step 2; in the test run both reported `320` and `139780.00`.
+Measured on the test run: 320 rows, sum `139780.00` before and after — an exact
+match.
 
-**If product rows were recreated between backup and restore**, their ids will
-have changed and the `id` join will silently match nothing. In that case join
-on the SKU instead, which is unique:
+### 9.5 Never restore an old full dump over production
 
-```sql
-UPDATE fivestore_store.products p
-  JOIN fivestore_restore.products r ON p.sku = r.sku AND p.sku IS NOT NULL
-   SET p.price = r.price;
+Importing a whole dump over the live database **silently discards everything
+added since it was taken**. Here that includes products and categories entered
+through `/admin`, image rows, site settings, administrator accounts and
+password changes, and active sessions.
+
+A full restore over production is permitted only when all of the following are
+true, and written down:
+
+- [ ] The live data is damaged beyond a targeted repair.
+- [ ] The age of the dump is known, and **what was created since has been
+      listed** — not guessed.
+- [ ] Losing that newer data is explicitly accepted by whoever owns the shop.
+- [ ] A dump of the **current** (damaged) database has been taken first, so the
+      decision is reversible.
+- [ ] The restore has been rehearsed into a scratch database and its row counts
+      checked (section 9.6).
+
+Otherwise: load the old dump into a scratch database and copy across only the
+rows or columns actually needed, as in section 9.4.
+
+### 9.6 Verifying a backup is restorable
+
+A dump that has never been read back is an assumption, not a backup. Check each
+one when it is taken:
+
+```sh
+BACKUP=~/backups/pre-price-$STAMP.sql
+
+# 1. Complete: mysqldump writes this trailer only on success.
+tail -1 "$BACKUP" | grep -q "Dump completed" && echo "complete" || echo "INCOMPLETE - do not rely on it"
+
+# 2. Not empty, and holds the tables expected.
+ls -lh "$BACKUP"
+grep -c "CREATE TABLE" "$BACKUP"
+
+# 3. It restores — into a scratch database, never over the live one.
+mysql --defaults-extra-file=/tmp/.dbcnf -e \
+  "DROP DATABASE IF EXISTS fivestore_verify; CREATE DATABASE fivestore_verify CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+mysql --defaults-extra-file=/tmp/.dbcnf fivestore_verify < "$BACKUP"
+
+# 4. Row counts match the live database.
+for t in categories products product_images users site_settings; do
+  live=$(mysql --defaults-extra-file=/tmp/.dbcnf -N -B -e "SELECT COUNT(*) FROM $t" "$(cat /tmp/dbname)")
+  copy=$(mysql --defaults-extra-file=/tmp/.dbcnf -N -B -e "SELECT COUNT(*) FROM $t" fivestore_verify)
+  printf "%-16s live=%-6s backup=%-6s %s\n" "$t" "$live" "$copy" "$([ "$live" = "$copy" ] && echo OK || echo MISMATCH)"
+done
+
+# 5. Clean up.
+mysql --defaults-extra-file=/tmp/.dbcnf -e "DROP DATABASE fivestore_verify;"
 ```
 
-Check `ROW_COUNT()` after either statement: a result of 0 means nothing
-matched, and the restore has not happened.
-
----
+Any `MISMATCH`, or a missing trailer, means the backup is not usable and the
+deployment must not proceed until a good one exists.
 
 ## 10. Risks specific to this release
 
