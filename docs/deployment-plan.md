@@ -438,6 +438,19 @@ Only then:
 php artisan migrate:rollback --step=1 --force
 ```
 
+**Tested.** Run against a scratch database holding a copy of the real priced
+catalog (`five_store_rbtest`, 320 products, all priced):
+
+```
+live figures            : 320 products, 320 priced, sum 139780.00
+export (wc -l)          : 320 rows
+export (awk sum)        : 139780.00          <- matches
+first rows              : 334  FUR-1001  420.00
+                          335  FUR-1002  2850.00
+after migrate:rollback  : column `price` no longer exists
+after migrate (re-apply): 0 priced, sum 0.00
+```
+
 ### 9.4 Restoring prices from the export
 
 ```sh
@@ -468,6 +481,24 @@ unique:
 awk -F'\t' '$2 != "" {printf "UPDATE products SET price=%s WHERE sku='"'"'%s'"'"';\n", $3, $2}' \
   ~/backups/prices-$STAMP.tsv > /tmp/restore-prices.sql
 ```
+
+**Both restore paths were tested** on the same scratch database, continuing
+from the rollback in section 9.3:
+
+```
+by id   : 320 UPDATE statements generated
+          UPDATE products SET price=420.00 WHERE id=334;
+          after applying -> 320 rows, sum 139780.00, FUR-1002 = 2850.00   <- exact match
+
+prices then cleared again to retest the fallback:
+
+by sku  : 320 UPDATE statements generated
+          UPDATE products SET price=420.00 WHERE sku='FUR-1001';
+          after applying -> 320 rows, sum 139780.00                        <- exact match
+```
+
+The scratch database was dropped afterwards; the figures above come from
+running these exact commands, not from reasoning about them.
 
 **If the only artifact is a full dump taken after prices existed** — a
 scheduled backup, not section 3's — the same copy-one-column approach works.
