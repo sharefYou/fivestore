@@ -785,8 +785,40 @@ directory and start again. If it surfaced after
 
 ```sh
 cd ~/five_store
-php artisan down --retry=30 2>/dev/null || true
-curl -s -o /dev/null -w '%{http_code}\n' https://fivestore.alwaysdata.net/   # expect 503
+php artisan down --retry=30 2>/dev/null || \
+  echo "artisan down failed — the release may be too broken to run it (see below)"
+```
+
+**`artisan down` returning is not proof that visitors are shut out.** A release
+broken enough to need a rollback is a release that may not be able to close
+itself, and the command can print nothing useful while the site keeps serving.
+Confirm it from outside, and make that confirmation a precondition rather than
+a line of output — 9.0 and 9.0.1 both call this:
+
+```sh
+confirm_site_closed() {
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 https://fivestore.alwaysdata.net/)
+    if [ "$code" = "503" ]; then
+        echo "site is closed to visitors (HTTP 503)"
+        return 0
+    fi
+    echo "STOP: the site answered HTTP $code — visitors are still being served."
+    echo "      Close it before rolling back; do not continue."
+    return 1
+}
+
+confirm_site_closed
+```
+
+If `artisan down` cannot run in the live tree at all, the flag is a
+self-contained file and can be produced by a release that does still work:
+
+```sh
+PREV="$HOME/five_store_prev-$RELEASE"            # or any intact copy
+(cd "$PREV" && php artisan down --retry=30) && \
+  cp "$PREV/storage/framework/maintenance.php" ~/five_store/storage/framework/ && \
+  (cd "$PREV" && php artisan up)
+confirm_site_closed
 ```
 
 ### 9.0 Swap the previous release back
@@ -810,7 +842,9 @@ RELEASE=<the id from section 5>
 PREV="$HOME/five_store_prev-$RELEASE"
 
 # --- Precondition. Everything below depends on it. -------------------------
-if [ ! -d "$PREV" ] || [ ! -f "$PREV/artisan" ] || [ ! -f "$PREV/vendor/autoload.php" ]; then
+if ! confirm_site_closed; then
+    echo "      Run nothing further in 9.0 until the site answers 503."
+elif [ ! -d "$PREV" ] || [ ! -f "$PREV/artisan" ] || [ ! -f "$PREV/vendor/autoload.php" ]; then
     echo "STOP: no usable previous release at $PREV"
     echo "      Run nothing further in 9.0. Go to section 9.0.1."
 else
@@ -869,66 +903,116 @@ live path, exactly as 9.0 does, and do **not** take `vendor/` from
 modifying, and if the failure was a half-finished `composer install` it is the
 damaged copy.
 
+Unlike 9.0, this path *builds* the tree it is going to install, so every step
+can fail. It is written as one function whose every step is a precondition for
+the next: the first failure returns, and **the live release is moved only
+after every check has passed**. Nothing here prints a warning and carries on.
+
 ```sh
-RESTORE=~/five_store_restore
-rm -rf "$RESTORE" && mkdir "$RESTORE"
+rollback_from_backup() {
+    RESTORE=~/five_store_restore
+    STAMP=<the stamp from section 3.2>
 
-# 1. Unpack the previous release next to the live one, never over it.
-tar -xzf ~/backups/app-$STAMP.tar.gz -C "$RESTORE" --strip-components=1
+    confirm_site_closed || return 1
 
-mkdir -p "$RESTORE"/storage/logs "$RESTORE"/storage/app/public \
-         "$RESTORE"/storage/app/private "$RESTORE"/storage/framework/cache/data \
-         "$RESTORE"/storage/framework/sessions "$RESTORE"/storage/framework/views
+    test -f ~/vendor-check.php || {
+        echo "STOP: ~/vendor-check.php is missing — re-create it from section 6.3"; return 1; }
 
-# 2. Rebuild the dependencies from the composer.lock that came out of the
-#    backup — the previous release's own lock, not the new one's.
-cd "$RESTORE"
-sha256sum composer.lock                       # compare with ~/backups/composer.lock-$STAMP.sha256
-composer install --no-dev --optimize-autoloader
+    rm -rf "$RESTORE" && mkdir "$RESTORE" || return 1
 
-# 3. The server-side state the backup deliberately leaves out.
-cp -a ~/five_store/.env "$RESTORE/.env"
-cp -a ~/five_store/storage/app/public/. "$RESTORE/storage/app/public/"
+    # 1. Unpack the previous release next to the live one, never over it.
+    tar -xzf ~/backups/app-$STAMP.tar.gz -C "$RESTORE" --strip-components=1 || {
+        echo "STOP: the backup archive did not extract"; return 1; }
 
-PRIV=~/five_store/storage/app/private
-if [ -d "$PRIV" ]; then
-    cp -a "$PRIV/." "$RESTORE/storage/app/private/"
-fi
+    mkdir -p "$RESTORE"/storage/logs "$RESTORE"/storage/app/public \
+             "$RESTORE"/storage/app/private "$RESTORE"/storage/framework/cache/data \
+             "$RESTORE"/storage/framework/sessions "$RESTORE"/storage/framework/views || return 1
+
+    # 2. The .env first: `composer install` runs `package:discover`, which boots
+    #    the application and needs it.
+    cp -a ~/five_store/.env "$RESTORE/.env" || {
+        echo "STOP: .env was not carried over"; return 1; }
+
+    # 3. Rebuild the dependencies from the composer.lock that came out of the
+    #    backup — the previous release's own lock, not the new one's.
+    sha256sum "$RESTORE/composer.lock"    # compare with ~/backups/composer.lock-$STAMP.sha256
+    (cd "$RESTORE" && composer install --no-dev --optimize-autoloader) || {
+        echo "STOP: composer install failed in $RESTORE — nothing was swapped"; return 1; }
+
+    # 4. Prove the dependencies BEFORE anything is moved. `vendor/autoload.php`
+    #    exists after a half-finished install too, so its presence proves
+    #    nothing; this compares every package against composer.lock.
+    php ~/vendor-check.php "$RESTORE" || {
+        echo "STOP: $RESTORE does not match its own composer.lock"; return 1; }
+
+    (cd "$RESTORE" && php artisan --version) || {
+        echo "STOP: $RESTORE cannot boot Laravel"; return 1; }
+
+    # 5. The server-side state the backup deliberately leaves out.
+    cp -a ~/five_store/storage/app/public/. "$RESTORE/storage/app/public/" || {
+        echo "STOP: the product images were not carried over"; return 1; }
+
+    PRIV=~/five_store/storage/app/private
+    if [ -d "$PRIV" ]; then
+        find "$PRIV" -mindepth 1 -maxdepth 1 -not -name livewire-tmp -not -name .gitignore
+        cp -a "$PRIV/." "$RESTORE/storage/app/private/" || {
+            echo "STOP: the private disk was not carried over"; return 1; }
+    fi
+
+    # 6. Close the restored tree, and confirm the flag is on disk. Without the
+    #    flag the swap reopens the site the instant it lands.
+    (cd "$RESTORE" && php artisan down --retry=30) || {
+        echo "STOP: artisan down failed in $RESTORE — nothing was swapped"; return 1; }
+    test -f "$RESTORE/storage/framework/maintenance.php" || {
+        echo "STOP: maintenance mode did not engage in $RESTORE — nothing was swapped"; return 1; }
+
+    # 7. Only now is anything moved.
+    rm -rf ~/five_store_broken
+    mv ~/five_store ~/five_store_broken || {
+        echo "STOP: could not move the live release aside"; return 1; }
+    mv "$RESTORE" ~/five_store || {
+        echo "CRITICAL: the live release is at ~/five_store_broken and the swap failed."
+        echo "          Put it back by hand: mv ~/five_store_broken ~/five_store"
+        return 1; }
+
+    cd ~/five_store || return 1
+    test -f storage/framework/maintenance.php || {
+        echo "CRITICAL: the maintenance flag did not survive the swap — the site may be open"
+        echo "          with an unverified release. Run: php artisan down --retry=30"
+        return 1; }
+    php artisan storage:link --force      # the tree carries a link from its own deploy
+    echo "swap complete — continue at 9.0.2"
+}
+
+rollback_from_backup || echo "ROLLBACK ABORTED — read the STOP line above."
 ```
 
+**Where the live release stands at each exit.** Every `return 1` before step 7
+leaves `~/five_store` exactly where it was, still closed, with its own files.
+The only two exits that have moved anything are labelled `CRITICAL` and say
+what to run; they exist because `mv` can still fail on a full disk or a
+permission change, and silence there would be worse than an instruction.
+
+**Why the gate runs here and not only in 9.0.2.** 9.0.2 runs `vendor-check.php`
+after the swap, which is the right place for a final confirmation but the wrong
+place for the only one: by then the live release has already been moved aside
+and the site is running on whatever was installed. An earlier version of this
+section tested `artisan` and `vendor/autoload.php` and nothing more — and
+`vendor/autoload.php` is written early by composer, so it survives a run that
+dies halfway through unpacking packages. That is precisely the failure 6.3
+exists to catch, and it has to be caught *before* the `mv`.
+
 If `composer install` cannot run at all — no network, packagist unreachable —
-the last resort is a copy of `vendor/` from `~/five_store`, and then **only**
-if the gate in 9.0.2 passes on it. A copy that the gate rejects is not a
-rollback, it is a second outage.
+the last resort is a copy of `vendor/` from `~/five_store`, inserted at step 3
+in place of the install, and then **only** if `php ~/vendor-check.php
+"$RESTORE"` at step 4 passes on it. A copy the gate rejects is not a rollback,
+it is a second outage.
 
 If images were lost rather than merely stale, restore them from their own
-backup instead of step 3's copy:
+backup instead of step 5's copy:
 
 ```sh
 tar -xzf ~/backups/storage-$STAMP.tar.gz -C "$RESTORE"
-```
-
-Then close the restored tree and swap it in — under the same precondition as
-9.0, and for the same reason. The `tar` or the `composer install` above may
-have failed, and an incomplete `$RESTORE` must never be moved into place:
-
-```sh
-if [ ! -f "$RESTORE/artisan" ] || [ ! -f "$RESTORE/vendor/autoload.php" ]; then
-    echo "STOP: $RESTORE is incomplete — nothing was swapped."
-    echo "      Fix the extraction or the composer install and repeat 9.0.1."
-else
-    (cd "$RESTORE" && php artisan down --retry=30)
-    test -f "$RESTORE/storage/framework/maintenance.php" && echo "restored tree is closed"
-
-    rm -rf ~/five_store_broken
-    mv ~/five_store ~/five_store_broken
-    mv "$RESTORE" ~/five_store
-
-    cd ~/five_store
-    test -f storage/framework/maintenance.php && echo "still closed after the swap"
-    php artisan storage:link --force    # the tree carries a link from its own deploy
-    echo "swap complete — continue at 9.0.2"
-fi
 ```
 
 ### 9.0.2 Prove the restored release runs, and only then reopen
@@ -1109,6 +1193,70 @@ $force`, so with a real symlink it is removed and recreated. That branch was
 read from the installed framework source rather than executed: on Windows
 `is_link()` is false even for a working link, so the local fixture cannot
 represent it.
+
+**9.0.1 and the closed-site gate.** Both functions were extracted from this
+file and run as written, against an isolated copy: a live "broken" release
+holding the `.env` and five product images, a section-3.2 backup archive with
+no `vendor/` in it, and the real `vendor/` (113 packages after `--no-dev`)
+reaching `$RESTORE` through `composer install`. `confirm_site_closed` was
+pointed at a local endpoint whose status code the test controls.
+
+```
+confirm_site_closed, against a real HTTP endpoint:
+  endpoint 503  -> "site is closed to visitors (HTTP 503)"          return 0
+  endpoint 200  -> "STOP: the site answered HTTP 200 ..."           return 1
+  endpoint 500  -> "STOP: the site answered HTTP 500 ..."           return 1
+                   (a release broken enough to need a rollback can still be
+                    answering visitors; 500 is not closed)
+
+9.0 with a COMPLETE previous release, but the site still serving (HTTP 200):
+  STOP printed, and then: .env copied into $PREV            : no
+                          $PREV put into maintenance        : no
+                          five_store_broken created         : no
+                          live release                      : untouched
+
+9.0.1, composer install fails with vendor/autoload.php still present:
+  STOP: composer install failed in $RESTORE - nothing was swapped
+  autoload.php left behind in $RESTORE  : yes - the old check would have passed
+  live release untouched (fingerprint)  : YES      images 5 of 5
+  still closed to visitors              : DOWN     five_store_broken: no
+
+9.0.1, composer exits 0 but vendor is incomplete:
+  vendor-check: listed but directory missing/empty : 3
+  STOP: $RESTORE does not match its own composer.lock
+  autoload.php present                  : yes - again, the old check passed
+  live release untouched (fingerprint)  : YES      images 5 of 5
+  still closed to visitors              : DOWN     five_store_broken: no
+
+9.0.1, artisan down reports success but writes no maintenance file:
+  STOP: maintenance mode did not engage in $RESTORE - nothing was swapped
+  live release still in place           : yes, untouched
+  restored tree reached the live path   : no
+
+9.0.1, artisan down exits non-zero:
+  STOP: artisan down failed in $RESTORE - nothing was swapped
+  live release still in place           : yes, untouched
+  restored tree reached the live path   : no
+
+9.0.1, successful restore:
+  vendor matches composer.lock          : 113 required, 0 missing, 0 dev
+  $RESTORE boots                        : Laravel Framework 13.38.0
+  maintenance engaged before the swap, still DOWN after it
+  images carried over                   : 5 of 5
+  .env and private disk carried over    : yes
+  live tree is the restored release     : yes
+  vendor gate re-run on the live tree   : PASS
+  broken release preserved              : five_store_broken
+  function returned 0 -> continue at 9.0.2
+```
+
+In all four failure cases nothing was moved, `~/five_store` was byte-identical
+to its state beforehand, and the site stayed closed. Two of the cases needed a
+stand-in to produce the failure: `composer` was replaced by a script that
+reproduces the two states a failed install leaves behind, and for the
+maintenance cases `artisan` was replaced by one that reports success without
+writing the file. Everything else — the backup archive, the dependency tree,
+`vendor-check.php`, and both functions — was the real thing.
 
 ### 9.1 Rolling back the price migration destroys every price
 
