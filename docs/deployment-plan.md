@@ -801,38 +801,59 @@ installs into the staging directory, never into a live release, so no failed
 release directory**, so the flag does not survive a swap. The previous release
 is therefore closed before it is moved back, not after.
 
+**The whole procedure is one `if`/`else`,** so that pasting it in a single
+block is safe: if the previous release is not usable, nothing inside runs at
+all.
+
 ```sh
 RELEASE=<the id from section 5>
 PREV="$HOME/five_store_prev-$RELEASE"
-test -d "$PREV" || echo "previous release is gone — use 9.0.1 instead"
 
-# Carry over the things that belong to the server, not to a release.
-cp -a ~/five_store/.env "$PREV/.env"
-mkdir -p "$PREV/storage/app/public" "$PREV/storage/app/private"
-cp -a ~/five_store/storage/app/public/. "$PREV/storage/app/public/"
+# --- Precondition. Everything below depends on it. -------------------------
+if [ ! -d "$PREV" ] || [ ! -f "$PREV/artisan" ] || [ ! -f "$PREV/vendor/autoload.php" ]; then
+    echo "STOP: no usable previous release at $PREV"
+    echo "      Run nothing further in 9.0. Go to section 9.0.1."
+else
+    # Carry over the things that belong to the server, not to a release.
+    cp -a ~/five_store/.env "$PREV/.env"
+    mkdir -p "$PREV/storage/app/public" "$PREV/storage/app/private"
+    cp -a ~/five_store/storage/app/public/. "$PREV/storage/app/public/"
 
-ls ~/five_store/storage/app/public/products | wc -l     # these two numbers
-ls "$PREV"/storage/app/public/products      | wc -l     # must match
+    ls ~/five_store/storage/app/public/products | wc -l     # these two numbers
+    ls "$PREV"/storage/app/public/products      | wc -l     # must match
 
-# The private disk, under the same rule as 6.4: checked, copied, never silenced.
-PRIV=~/five_store/storage/app/private
-if [ -d "$PRIV" ]; then
-    find "$PRIV" -mindepth 1 -maxdepth 1 -not -name livewire-tmp -not -name .gitignore
-    cp -a "$PRIV/." "$PREV/storage/app/private/"
+    # The private disk, under the rule in 6.4: checked, copied, never silenced.
+    PRIV=~/five_store/storage/app/private
+    if [ -d "$PRIV" ]; then
+        find "$PRIV" -mindepth 1 -maxdepth 1 -not -name livewire-tmp -not -name .gitignore
+        cp -a "$PRIV/." "$PREV/storage/app/private/"
+    fi
+
+    # Close it before it becomes the live one.
+    (cd "$PREV" && php artisan down --retry=30)
+    test -f "$PREV/storage/framework/maintenance.php" && echo "previous release is closed"
+
+    rm -rf ~/five_store_broken
+    mv ~/five_store ~/five_store_broken
+    mv "$PREV" ~/five_store
+
+    cd ~/five_store
+    test -f storage/framework/maintenance.php && echo "still closed after the swap"
+    php artisan storage:link --force    # the tree carries a link from its own deploy
+    echo "swap complete — continue at 9.0.2"
 fi
-
-# Close it before it becomes the live one.
-(cd "$PREV" && php artisan down --retry=30)
-test -f "$PREV/storage/framework/maintenance.php" && echo "previous release is closed"
-
-rm -rf ~/five_store_broken
-mv ~/five_store ~/five_store_broken
-mv "$PREV" ~/five_store
-
-cd ~/five_store
-test -f storage/framework/maintenance.php && echo "still closed after the swap"
-php artisan storage:link
 ```
+
+**Why the precondition is a branch and not a warning.** An earlier version of
+this plan opened with
+`test -d "$PREV" || echo "previous release is gone"`, which printed a line and
+carried on. With `$PREV` missing, the `mkdir -p` two lines later would have
+*created* it, the copies would have filled it with `.env` and the images and
+nothing else, `php artisan down` would have failed inside a tree with no
+`artisan`, and the two `mv`s would then have installed that near-empty
+directory as the live site — turning a recoverable failed deployment into a
+destroyed one. The test also covers a directory that exists but has been
+gutted, which a bare `-d` would have accepted.
 
 Keep `~/five_store_broken` until the restored site has been checked properly; it
 holds the logs that explain what went wrong.
@@ -887,19 +908,27 @@ backup instead of step 3's copy:
 tar -xzf ~/backups/storage-$STAMP.tar.gz -C "$RESTORE"
 ```
 
-Then close the restored tree and swap it in:
+Then close the restored tree and swap it in — under the same precondition as
+9.0, and for the same reason. The `tar` or the `composer install` above may
+have failed, and an incomplete `$RESTORE` must never be moved into place:
 
 ```sh
-(cd "$RESTORE" && php artisan down --retry=30)
-test -f "$RESTORE/storage/framework/maintenance.php" && echo "restored tree is closed"
+if [ ! -f "$RESTORE/artisan" ] || [ ! -f "$RESTORE/vendor/autoload.php" ]; then
+    echo "STOP: $RESTORE is incomplete — nothing was swapped."
+    echo "      Fix the extraction or the composer install and repeat 9.0.1."
+else
+    (cd "$RESTORE" && php artisan down --retry=30)
+    test -f "$RESTORE/storage/framework/maintenance.php" && echo "restored tree is closed"
 
-rm -rf ~/five_store_broken
-mv ~/five_store ~/five_store_broken
-mv "$RESTORE" ~/five_store
+    rm -rf ~/five_store_broken
+    mv ~/five_store ~/five_store_broken
+    mv "$RESTORE" ~/five_store
 
-cd ~/five_store
-test -f storage/framework/maintenance.php && echo "still closed after the swap"
-php artisan storage:link
+    cd ~/five_store
+    test -f storage/framework/maintenance.php && echo "still closed after the swap"
+    php artisan storage:link --force    # the tree carries a link from its own deploy
+    echo "swap complete — continue at 9.0.2"
+fi
 ```
 
 ### 9.0.2 Prove the restored release runs, and only then reopen
@@ -1023,6 +1052,63 @@ section 6.3, the gate script as written in this file:
 ```
 
 A check that cannot fail is not a check; both directions were exercised.
+
+The 9.0 precondition was tested the same way — the block extracted from this
+file and run as written, against an isolated copy carrying the real `artisan`
+and `vendor` (18 510 files) and four product images.
+
+```
+previous release MISSING:
+  output                      : "STOP: no usable previous release at ..."
+                                "Run nothing further in 9.0. Go to section 9.0.1."
+  five_store_prev-TESTREL     : not created
+  five_store_broken           : not created
+  live tree                   : 18510 files, fingerprint unchanged
+  live tree boots             : Laravel Framework 13.38.0
+  images                      : 4 of 4
+  maintenance flag            : absent - the live release was never touched
+
+previous release EXISTS but gutted (1 file, no artisan, no vendor):
+  output                      : same STOP - a bare `test -d` would have accepted it
+  live tree fingerprint       : unchanged
+  .env copied into it         : no
+  five_store_broken           : not created
+
+previous release present and complete:
+  images carried over         : 4 of 4
+  .env and private disk       : carried over
+  previous release closed before the swap, still DOWN after it
+  restored tree is the previous release (marker file present)
+  restored tree boots         : Laravel Framework 13.38.0
+  failed release preserved    : five_store_broken, 18510 files
+  after 9.0.2's checks and `artisan up` : LIVE
+```
+
+And the same block **as it stood in commit `c57cbb22`**, with the previous
+release missing, on a lightweight tree — the damage lands before `artisan` is
+ever reached, so no `vendor/` is needed to show it:
+
+```
+  output : "previous release is gone - use 9.0.1 instead"
+           cp: cannot create .../five_store_prev-TESTREL/.env: No such file or directory
+           Could not open input file: artisan      (x2)
+  home   : five_store  five_store_broken
+  five_store is now          : 4 files - the product images and nothing else
+  artisan                    : *** GONE ***
+  app/ code                  : 0 files
+  the real release           : moved aside into five_store_broken (31 files)
+```
+
+The warning printed, and every destructive step ran anyway.
+
+One detail the test surfaced: the restored tree carries a `public/storage`
+symlink from its own deployment, so a plain `php artisan storage:link` reports
+"link already exists" as an **error** in the middle of a rollback. `--force`
+avoids that — `StorageLinkCommand::isRemovableSymlink()` is `is_link($link) &&
+$force`, so with a real symlink it is removed and recreated. That branch was
+read from the installed framework source rather than executed: on Windows
+`is_link()` is false even for a working link, so the local fixture cannot
+represent it.
 
 ### 9.1 Rolling back the price migration destroys every price
 
