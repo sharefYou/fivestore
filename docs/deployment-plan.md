@@ -507,12 +507,47 @@ replaced. Only once visitors are shut out can uploads no longer change, so the
 images are copied now rather than earlier:
 
 ```sh
-cp -a ~/five_store/storage/app/public/.  "$NEXT/storage/app/public/"
-cp -a ~/five_store/storage/app/private/. "$NEXT/storage/app/private/" 2>/dev/null || true
+cp -a ~/five_store/storage/app/public/. "$NEXT/storage/app/public/"
 
 ls ~/five_store/storage/app/public/products | wc -l     # these two numbers
 ls "$NEXT"/storage/app/public/products      | wc -l     # must match
+
+# storage/app/private holds in-progress uploads and nothing else — see below.
+# Confirm that is still true instead of assuming it.
+PRIV=~/five_store/storage/app/private
+if [ -d "$PRIV" ]; then
+    find "$PRIV" -mindepth 1 -maxdepth 1 -not -name livewire-tmp -not -name .gitignore
+    #  ^ must print nothing. Anything listed is written by something this plan
+    #    does not know about: stop and find out what, before continuing.
+    cp -a "$PRIV/." "$NEXT/storage/app/private/"
+    echo "private disk carried over"
+else
+    echo "no storage/app/private on the server yet — nothing to carry over"
+fi
 ```
+
+**On `storage/app/private`.** It is the root of the `local` disk
+(`config/filesystems.php`), and in this application exactly one thing writes
+there: Livewire's temporary uploads, pinned to that disk in
+`AppServiceProvider::register()` so that half-finished uploads are never
+published under `/storage` before validation has accepted them. They land in
+`livewire-tmp/`, and Livewire deletes anything older than 24 hours whenever an
+upload form is opened — `WithFileUploads::cleanupOldUploads()`, confirmed in the
+installed v4.4.8 source, enabled by default. Every file this application keeps
+goes through `App\Services\ImageStorage` onto the `public` disk instead, and no
+database row points into the private disk.
+
+**So the whole cost of losing this directory is that an administrator who had a
+file selected in `/admin` but had not yet saved the form must select it again.**
+Nothing else. Given a maintenance window of well under a minute, that is close
+to unreachable in practice.
+
+That is a reason to state the impact, not to hide the error. The previous
+version of this step ended in `2>/dev/null || true`, which would equally have
+swallowed a failure from a full disk or wrong permissions, and would silently
+drop the contents if some later feature ever stored something real there. The
+`find` is what notices that; the missing directory is reported rather than
+ignored; and the `cp` itself now fails loudly if it fails at all.
 
 The maintenance flag lives in `storage/framework/maintenance.php` **inside the
 release directory**, so it does not travel across a swap. Close the new release
@@ -615,6 +650,17 @@ echo 'catalog disk    : '.config('catalog.images.disk').PHP_EOL;"
 ```
 
 Expect `local` for temporary uploads and `public` for catalog images.
+
+```sh
+# The `local` disk is storage/app/private, and only Livewire's in-progress
+# uploads belong in it. Anything else is unexpected (section 6.4).
+find storage/app/private -mindepth 1 -maxdepth 1 -not -name livewire-tmp -not -name .gitignore
+ls storage/app/private/livewire-tmp 2>/dev/null | wc -l   # stale temp uploads, if any
+```
+
+The second number is informational: Livewire clears entries older than 24 hours
+by itself, so a large count means uploads are being started and abandoned, not
+that anything is broken.
 
 ---
 
@@ -760,13 +806,20 @@ RELEASE=<the id from section 5>
 PREV="$HOME/five_store_prev-$RELEASE"
 test -d "$PREV" || echo "previous release is gone — use 9.0.1 instead"
 
-# Carry over the two things that belong to the server, not to a release.
+# Carry over the things that belong to the server, not to a release.
 cp -a ~/five_store/.env "$PREV/.env"
-mkdir -p "$PREV/storage/app/public"
+mkdir -p "$PREV/storage/app/public" "$PREV/storage/app/private"
 cp -a ~/five_store/storage/app/public/. "$PREV/storage/app/public/"
 
 ls ~/five_store/storage/app/public/products | wc -l     # these two numbers
 ls "$PREV"/storage/app/public/products      | wc -l     # must match
+
+# The private disk, under the same rule as 6.4: checked, copied, never silenced.
+PRIV=~/five_store/storage/app/private
+if [ -d "$PRIV" ]; then
+    find "$PRIV" -mindepth 1 -maxdepth 1 -not -name livewire-tmp -not -name .gitignore
+    cp -a "$PRIV/." "$PREV/storage/app/private/"
+fi
 
 # Close it before it becomes the live one.
 (cd "$PREV" && php artisan down --retry=30)
@@ -815,6 +868,11 @@ composer install --no-dev --optimize-autoloader
 # 3. The server-side state the backup deliberately leaves out.
 cp -a ~/five_store/.env "$RESTORE/.env"
 cp -a ~/five_store/storage/app/public/. "$RESTORE/storage/app/public/"
+
+PRIV=~/five_store/storage/app/private
+if [ -d "$PRIV" ]; then
+    cp -a "$PRIV/." "$RESTORE/storage/app/private/"
+fi
 ```
 
 If `composer install` cannot run at all — no network, packagist unreachable —
