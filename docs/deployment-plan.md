@@ -120,8 +120,22 @@ tar -czf ~/backups/storage-$STAMP.tar.gz -C ~/five_store storage/app/public
 tar -czf ~/backups/app-$STAMP.tar.gz --exclude=vendor --exclude=node_modules \
   --exclude=storage/app/public -C ~ five_store
 
+# What the current release's dependencies are, so they can be rebuilt exactly
+# even if its directory is lost. Two small files, not a copy of vendor/.
+cp ~/five_store/composer.lock ~/backups/composer.lock-$STAMP
+sha256sum ~/five_store/composer.lock > ~/backups/composer.lock-$STAMP.sha256
+cp ~/five_store/vendor/composer/installed.php ~/backups/installed.php-$STAMP
+chmod 600 ~/backups/composer.lock-$STAMP* ~/backups/installed.php-$STAMP
+
 ls -lh ~/backups
 ```
+
+`app-$STAMP.tar.gz` excludes `vendor/`, which is right — it is reproducible
+from `composer.lock` and would multiply the size of every backup. The
+**primary** known-good copy of the dependencies is not a backup at all:
+section 6.4 moves the outgoing release to `~/five_store_prev-$RELEASE` with its
+`vendor/` untouched, and section 9.0 swaps that directory back. The lock file
+above is the fallback for the case where that directory is gone.
 
 Keep `$STAMP` for the rest of the deployment; sections 6 and 9 refer to these
 filenames.
@@ -194,6 +208,8 @@ tar -czf "/tmp/code-$RELEASE.tar.gz" \
   --exclude='./storage/app/public' --exclude='./storage/app/private' \
   --exclude='./storage/logs' --exclude='./storage/framework/cache/data' \
   --exclude='./storage/framework/sessions' --exclude='./storage/framework/views' \
+  --exclude='./storage/inertia-devtools' \
+  --exclude='./bootstrap/cache/packages.php' --exclude='./bootstrap/cache/services.php' \
   --exclude='./.claude' --exclude='./.mcp.json' --exclude='./boost.json' \
   --exclude='./CLAUDE.md' --exclude='./AGENTS.md' \
   --exclude='./docs' --exclude='./.phpunit.result.cache' \
@@ -203,6 +219,18 @@ tar -czf "/tmp/code-$RELEASE.tar.gz" \
 # Asset archive — public/build and nothing else.
 tar -czf "/tmp/assets-$RELEASE.tar.gz" public/build
 ```
+
+Two of those excludes are easy to miss, because both directories sit in
+`.gitignore` and so never appear in a `git status`:
+
+- `storage/inertia-devtools/` is Inertia's local profiling dump — 248 JSON
+  files, 4.6 MB of one developer's browsing, with no function on a server.
+- `bootstrap/cache/packages.php` and `services.php` are Laravel's package
+  manifest, and the locally built copy names `laravel/boost`, `laravel/pail`,
+  `nunomaduro/collision` and three other **dev-only** providers. Shipping it
+  writes the one dependency section 10 says must not reach production into the
+  server's boot path by name. `composer install` regenerates it correctly in
+  section 6.2, so it does not belong in the archive at all.
 
 Both archives carry the same `$RELEASE` in their names. Keep
 `$MANIFEST_HASH` to hand; section 6 checks it again on the server.
@@ -224,6 +252,8 @@ tar -tzf "$CODE" | grep -cE '^\./(CLAUDE|AGENTS)\.md$'
 tar -tzf "$CODE" | grep -cE '^\./(tests|docs|\.git)/'
 tar -tzf "$CODE" | grep -cE 'phpunit\.result\.cache|tsbuildinfo|security-fixes\.patch'
 tar -tzf "$CODE" | grep -cE '^\./public/build/'        # assets must NOT be here
+tar -tzf "$CODE" | grep -cE '^\./storage/inertia-devtools/'
+tar -tzf "$CODE" | grep -cE '^\./bootstrap/cache/[^/]+\.php$'
 
 # And these must be present.
 tar -tzf "$CODE" | grep -cE '^\./(artisan|composer\.json|composer\.lock)$'   # 3
@@ -293,24 +323,28 @@ replaced. **Do not continue unless every check in 5.2 and 5.3 passed.**
 
 ### 5.5 Measured on this working tree
 
-Both archives were built and inspected with the commands above:
+Both archives were built and inspected with the commands above. Counts are of
+regular files; `tar` also records a directory entry per directory.
 
 ```
-RELEASE        20261028-020910-a50c3185
+RELEASE        20261028-044556-0fc4392c
 MANIFEST_HASH  5573e3afcf48d5a3
 
-code archive   541 files, 2.0 MB
+code archive   198 files (288 entries), 1.7 MB
   .env / vendor / node_modules ............ 0
   .claude / .mcp.json / boost.json ........ 0
   CLAUDE.md / AGENTS.md ................... 0
   tests/ docs/ .git/ ...................... 0
   dev artifacts ........................... 0
+  storage/inertia-devtools/ ............... 0
+  bootstrap/cache/*.php ................... 0
   public/build/ ........................... 0   <- assets excluded
+  database/seeders/CatalogSeeder.php ...... 0   <- deleted from Git this release
   artisan + composer.json + composer.lock . 3
-  app/ files .............................. 83
-  database/migrations/ .................... 10
+  app/ files .............................. 53
+  database/migrations/ .................... 9
 
-asset archive  82 files, 1.1 MB
+asset archive  80 files, 1.1 MB
   manifest.json ........................... 1
   assets/ files ........................... 80
   anything outside public/build ........... 0
@@ -320,61 +354,190 @@ asset archive  82 files, 1.1 MB
 pairing        manifest hash in archive == hash recorded at build time
 ```
 
+The code archive was 288 entries, down from 541 before the two excludes added
+in 5.1: 251 of those entries were `storage/inertia-devtools/` and 2 were
+`bootstrap/cache/*.php`. The drop is accounted for exactly, which is the point
+of counting rather than reading the command.
+
 No `rsync --delete` anywhere: the remote tree is never pruned by this process.
 
 ---
 
 ## 6. The maintenance window
 
-Everything that changes the running site happens here, in this order. The
-window opens with `down` and closes with `up` — and `up` is only reached if
-the verification in section 8 passes.
+The release is assembled in a directory of its own, beside the running one, and
+swapped in. Nothing is extracted over the live tree and nothing is installed
+into it.
 
-### 6.1 Take the site down, using the release that is still running
+Two reasons, both of them failures this plan used to have:
+
+- **Extracting over the live tree never removes anything.** A file deleted from
+  Git stays on the server indefinitely. `database/seeders/CatalogSeeder.php` was
+  deleted in this release; under the old step it would still have been sitting
+  in `database/seeders/` afterwards, loadable by `db:seed`.
+- **`composer install` run inside the live tree rewrites the dependencies the
+  running site is using.** Composer deletes a package's directory before
+  unpacking its replacement. Interrupted in between, it leaves the live release
+  unable to boot — and leaves a damaged `vendor/` as the only thing a rollback
+  has to copy from.
+
+Only 6.4 onward changes what visitors see. Sections 6.1 to 6.3 run while the old
+release is still serving normally.
+
+### 6.1 Build the new release in its own directory
 
 ```sh
 ssh fivestore@ssh-fivestore.alwaysdata.net
-cd ~/five_store
-php artisan down --retry=30
+RELEASE=<the id from section 5>
+NEXT=~/five_store_next-$RELEASE
+
+rm -rf "$NEXT" && mkdir -p "$NEXT"
+tar -xzf ~/releases/code-$RELEASE.tar.gz   -C "$NEXT"
+tar -xzf ~/releases/assets-$RELEASE.tar.gz -C "$NEXT"     # creates public/build
+
+# The archives carry no writable runtime directories — section 5 excludes them
+# all. Extracting over an existing tree used to hide that; a clean directory
+# does not, so create them.
+mkdir -p "$NEXT"/storage/logs "$NEXT"/storage/app/public "$NEXT"/storage/app/private \
+         "$NEXT"/storage/framework/cache/data "$NEXT"/storage/framework/sessions \
+         "$NEXT"/storage/framework/views
+
+# The one server-side file that is never in an archive.
+cp -a ~/five_store/.env "$NEXT/.env"
+
+# The assets on disk must be the ones verified locally.
+sha256sum "$NEXT/public/build/manifest.json" | cut -c1-16      # must equal $MANIFEST_HASH
 ```
 
-This is run **before** any file is replaced, so it is the current, working
-application that puts itself into maintenance. Running it after a partial swap
-would mean asking half-replaced code to do it.
-
-`down` writes `storage/framework/maintenance.php`, and `storage/` is never
-replaced by either archive, so maintenance stays active across the swap.
-
-Confirm from outside that visitors see the maintenance page:
+Confirm the new tree holds only what the release contains — in particular that
+files deleted from Git are not in it:
 
 ```sh
+test -e "$NEXT/database/seeders/CatalogSeeder.php" \
+  && echo "UNEXPECTED: a file deleted from Git is present" || echo "deleted files are absent"
+ls "$NEXT/database/seeders/"      # DatabaseSeeder.php  RealisticCatalogSeeder.php  data
+```
+
+`~/five_store` has not been touched by anything above.
+
+### 6.2 Install the dependencies in the new directory
+
+```sh
+cd "$NEXT"
+composer install --no-dev --optimize-autoloader
+```
+
+This is the slow step and the one most likely to fail, and here it costs nothing
+if it does: the running release's `vendor/` is never opened for writing. On
+failure, `rm -rf "$NEXT"`, fix the cause, start again — the site has not been
+touched and there is nothing to roll back.
+
+It also regenerates `bootstrap/cache/packages.php` for the production dependency
+set. Section 5 excludes that file from the archive precisely so that this step
+is what produces it: the copy built on a development machine names
+`laravel/boost` and five other dev-only providers, and shipping it would leave
+the server one failed `composer install` away from a fatal "class not found" on
+every request.
+
+### 6.3 Prove the dependencies are complete
+
+**An exit code of 0 is not evidence that `vendor/` is complete** — not from
+`composer install`, and not from `cp`. Check the tree against its own
+`composer.lock`:
+
+```sh
+cat > ~/vendor-check.php <<'PHPEOF'
+<?php
+$root = rtrim($argv[1] ?? '.', '/');
+$fail = function (string $m) { fwrite(STDERR, "VENDOR CHECK FAILED: $m\n"); exit(1); };
+foreach (['composer.lock', 'vendor/autoload.php', 'vendor/composer/installed.php'] as $f) {
+    is_file("$root/$f") || $fail("$f is missing");
+}
+$lock = json_decode(file_get_contents("$root/composer.lock"), true);
+$want = [];
+foreach ($lock['packages'] as $p) { $want[$p['name']] = $p['version']; }   // prod only
+$have = (require "$root/vendor/composer/installed.php")['versions'] ?? [];
+$notInstalled = $wrongVersion = $missingDir = [];
+foreach ($want as $name => $version) {
+    if (! isset($have[$name])) { $notInstalled[] = $name; continue; }
+    if (($have[$name]['pretty_version'] ?? null) !== $version) {
+        $wrongVersion[] = $name;
+    }
+    $dir = "$root/vendor/$name";
+    if (! is_dir($dir) || count(scandir($dir)) <= 2) { $missingDir[] = $name; }
+}
+$dev = array_intersect(array_keys($have), array_column($lock['packages-dev'], 'name'));
+printf("required by composer.lock          : %d\n", count($want));
+printf("absent from installed.php          : %d\n", count($notInstalled));
+printf("version mismatch                   : %d\n", count($wrongVersion));
+printf("listed but directory missing/empty : %d\n", count($missingDir));
+printf("dev packages present (must be 0)   : %d\n", count($dev));
+foreach (array_slice(array_merge($notInstalled, $wrongVersion, $missingDir, $dev), 0, 5) as $p) {
+    echo "  BAD $p\n";
+}
+if ($notInstalled || $wrongVersion || $missingDir || $dev) { $fail('vendor does not match composer.lock'); }
+echo "vendor matches composer.lock\n";
+PHPEOF
+
+php ~/vendor-check.php "$NEXT"        # must print "vendor matches composer.lock"
+echo "gate exit: $?"                  # must be 0
+
+(cd "$NEXT" && php artisan --version) # must print "Laravel Framework 13.x"
+```
+
+Composer removes a package's directory before unpacking its replacement, so an
+interrupted run leaves directories missing while `vendor/composer/installed.php`
+still lists them. That is precisely what this compares. The `dev packages` line
+guards the other direction: `--no-dev` must not have left `laravel/boost` or
+`nunomaduro/collision` on the server.
+
+**Do not open the maintenance window unless both commands pass.** Everything up
+to this point is undone by deleting a directory.
+
+### 6.4 Open the window and swap the directories
+
+```sh
+cd ~/five_store
+php artisan down --retry=30
 curl -s -o /dev/null -w '%{http_code}\n' https://fivestore.alwaysdata.net/   # expect 503
 ```
 
-### 6.2 Replace the code and the assets
+`down` is run by the current, working release, before any file of it is
+replaced. Only once visitors are shut out can uploads no longer change, so the
+images are copied now rather than earlier:
 
 ```sh
-cd ~/five_store
-RELEASE=<the id from section 5>
+cp -a ~/five_store/storage/app/public/.  "$NEXT/storage/app/public/"
+cp -a ~/five_store/storage/app/private/. "$NEXT/storage/app/private/" 2>/dev/null || true
 
-tar -xzf ~/releases/code-$RELEASE.tar.gz
-
-rm -rf public/build
-tar -xzf ~/releases/assets-$RELEASE.tar.gz      # restores public/build
-
-# The assets on disk must be the ones that were verified locally.
-sha256sum public/build/manifest.json | cut -c1-16     # must equal $MANIFEST_HASH
+ls ~/five_store/storage/app/public/products | wc -l     # these two numbers
+ls "$NEXT"/storage/app/public/products      | wc -l     # must match
 ```
 
-`.env`, `storage/` and `vendor/` are absent from both archives, so none of them
-is touched here.
+The maintenance flag lives in `storage/framework/maintenance.php` **inside the
+release directory**, so it does not travel across a swap. Close the new release
+too, before it becomes the live one:
 
-### 6.3 Dependencies, migration, caches
+```sh
+(cd "$NEXT" && php artisan down --retry=30)
+test -f "$NEXT/storage/framework/maintenance.php" && echo "new release is closed"
+
+mv ~/five_store "$HOME/five_store_prev-$RELEASE"
+mv "$NEXT" ~/five_store
+
+cd ~/five_store
+test -f storage/framework/maintenance.php && echo "still closed after the swap"
+php artisan storage:link        # the link stores an absolute path, so remake it here
+```
+
+**Keep `~/five_store_prev-$RELEASE`.** It is a complete, working release whose
+`vendor/` nothing has written to, and section 9 rolls back by swapping it
+straight back in.
+
+### 6.5 Migration and caches
 
 ```sh
 cd ~/five_store
-composer install --no-dev --optimize-autoloader
-
 php artisan migrate --force          # adds the nullable price column
 
 php artisan config:cache
@@ -383,27 +546,31 @@ php artisan view:cache
 ```
 
 The migration is additive: one nullable column, no data rewritten, no table
-rebuilt beyond the `ALTER`. Existing products simply have `price = NULL` and
-the storefront shows no price for them, which is the intended behaviour.
+rebuilt beyond the `ALTER`. Existing products simply have `price = NULL` and the
+storefront shows no price for them, which is the intended behaviour.
 
 **Do not run `db:seed`.** See section 1.
 
-### 6.4 Verify before reopening
+### 6.6 Verify before reopening
 
 Run section 7 (storage and permissions) and section 8 (verification), **while
 the site is still down**. The checks that need a browser can be run against the
-maintenance-bypass URL, or deferred to 6.5 and treated as blocking.
+maintenance-bypass URL, or deferred to 6.7 and treated as blocking.
 
 ```sh
-# The application itself answers correctly even while closed to visitors.
 php artisan about --only=environment
 php artisan tinker --execute="
 echo 'db       : '.DB::connection()->getDatabaseName().PHP_EOL;
 echo 'products : '.App\Models\Product::count().PHP_EOL;
+echo 'images   : '.App\Models\ProductImage::count().PHP_EOL;
 echo 'price col: '.(Schema::hasColumn('products','price') ? 'present' : 'MISSING').PHP_EOL;"
+
+# No developer tooling reached the server.
+composer show laravel/boost 2>&1 | tail -1          # expect "not found"
+ls storage/inertia-devtools 2>/dev/null | wc -l     # expect 0
 ```
 
-### 6.5 Reopen only on success
+### 6.7 Reopen only on success
 
 ```sh
 php artisan up
@@ -412,20 +579,24 @@ curl -s -o /dev/null -w '%{http_code}\n' https://fivestore.alwaysdata.net/   # e
 
 Then immediately run the section 8a checklist against the live site.
 
-### 6.6 If anything fails
+### 6.8 If anything fails
 
 **Leave the site in maintenance.** Do not run `php artisan up` to "see if it
 works" — a broken release serving real visitors is worse than a maintenance
 page.
 
 1. Capture the error (`storage/logs/laravel.log`, the failing command's output).
-2. Go to section 9 and restore the previous release.
-3. Re-run the verification in 6.4 against the restored release.
+2. Go to section 9 and swap the previous release back.
+3. Re-run 6.3 and 6.6 against the restored release.
 4. Only then `php artisan up`.
 
-The previous release's archive is still in `~/releases`, and the pre-deploy
-backups are in `~/backups`, so going back does not depend on rebuilding
-anything.
+Where the failure happened decides how much work this is:
+
+| Failure during | Site state | What to do |
+| --- | --- | --- |
+| 6.1 – 6.3 (staging) | still serving the old release | `rm -rf "$NEXT"` and start again; nothing to roll back |
+| 6.4 (the swap) | closed | section 9.0 — swap `five_store_prev-$RELEASE` back |
+| 6.5 – 6.6 | closed | section 9.0, plus section 9.3 if prices must be preserved |
 
 ---
 
@@ -561,7 +732,9 @@ catalog, record that it was deliberate.
 ## 9. Rollback
 
 **The site stays closed for all of this.** If the failure happened inside the
-window of section 6, it is already down — leave it down. If it surfaced after
+window of section 6, it is already down — leave it down. If it failed in 6.1
+to 6.3 the site was never closed and never changed: delete the staging
+directory and start again. If it surfaced after
 `php artisan up`, close the site again before touching anything.
 
 ```sh
@@ -570,116 +743,228 @@ php artisan down --retry=30 2>/dev/null || true
 curl -s -o /dev/null -w '%{http_code}\n' https://fivestore.alwaysdata.net/   # expect 503
 ```
 
-### 9.0 Restore the previous release without reopening the site
+### 9.0 Swap the previous release back
 
-`php artisan down` works by writing `storage/framework/maintenance.php` **inside
-the application directory**. Moving that directory aside takes the flag with
-it, and the backup from section 3.2 was taken before the window opened, so it
-does not contain one. Restoring straight over the live path therefore reopens
-the site the instant the files land — before the caches are rebuilt and before
-anything has been verified.
+Section 6.4 moved the old release to `~/five_store_prev-$RELEASE` instead of
+overwriting it. It is a complete, working tree, and — this is the point — its
+`vendor/` has not been written to since that release installed it. Section 6.2
+installs into the staging directory, never into a live release, so no failed
+`composer install` can have touched it.
 
-So the restored tree is assembled **outside** the live path, put into
-maintenance there, and only then swapped in:
+`php artisan down` writes `storage/framework/maintenance.php` **inside the
+release directory**, so the flag does not survive a swap. The previous release
+is therefore closed before it is moved back, not after.
 
 ```sh
-cd ~
+RELEASE=<the id from section 5>
+PREV="$HOME/five_store_prev-$RELEASE"
+test -d "$PREV" || echo "previous release is gone — use 9.0.1 instead"
+
+# Carry over the two things that belong to the server, not to a release.
+cp -a ~/five_store/.env "$PREV/.env"
+mkdir -p "$PREV/storage/app/public"
+cp -a ~/five_store/storage/app/public/. "$PREV/storage/app/public/"
+
+ls ~/five_store/storage/app/public/products | wc -l     # these two numbers
+ls "$PREV"/storage/app/public/products      | wc -l     # must match
+
+# Close it before it becomes the live one.
+(cd "$PREV" && php artisan down --retry=30)
+test -f "$PREV/storage/framework/maintenance.php" && echo "previous release is closed"
+
+rm -rf ~/five_store_broken
+mv ~/five_store ~/five_store_broken
+mv "$PREV" ~/five_store
+
+cd ~/five_store
+test -f storage/framework/maintenance.php && echo "still closed after the swap"
+php artisan storage:link
+```
+
+Keep `~/five_store_broken` until the restored site has been checked properly; it
+holds the logs that explain what went wrong.
+
+Go to 9.0.2 before reopening.
+
+### 9.0.1 If the previous release directory is gone
+
+Only when `~/five_store_prev-$RELEASE` no longer exists — a rollback in a much
+later session, or a cleanup that went too far. Assemble the tree outside the
+live path, exactly as 9.0 does, and do **not** take `vendor/` from
+`~/five_store`: that is the release the deployment was in the middle of
+modifying, and if the failure was a half-finished `composer install` it is the
+damaged copy.
+
+```sh
 RESTORE=~/five_store_restore
 rm -rf "$RESTORE" && mkdir "$RESTORE"
 
-# 1. Unpack the previous release next to the live one, not over it.
+# 1. Unpack the previous release next to the live one, never over it.
 tar -xzf ~/backups/app-$STAMP.tar.gz -C "$RESTORE" --strip-components=1
 
-# 2. Carry over the things the backup deliberately leaves out.
+mkdir -p "$RESTORE"/storage/logs "$RESTORE"/storage/app/public \
+         "$RESTORE"/storage/app/private "$RESTORE"/storage/framework/cache/data \
+         "$RESTORE"/storage/framework/sessions "$RESTORE"/storage/framework/views
+
+# 2. Rebuild the dependencies from the composer.lock that came out of the
+#    backup — the previous release's own lock, not the new one's.
+cd "$RESTORE"
+sha256sum composer.lock                       # compare with ~/backups/composer.lock-$STAMP.sha256
+composer install --no-dev --optimize-autoloader
+
+# 3. The server-side state the backup deliberately leaves out.
 cp -a ~/five_store/.env "$RESTORE/.env"
-cp -a ~/five_store/vendor "$RESTORE/vendor" 2>/dev/null || \
-  (cd "$RESTORE" && composer install --no-dev --optimize-autoloader)
-
-#    Uploaded images are excluded from app-*.tar.gz on purpose; without this
-#    step every product photograph would disappear with the rollback.
-mkdir -p "$RESTORE/storage/app/public"
 cp -a ~/five_store/storage/app/public/. "$RESTORE/storage/app/public/"
+```
 
-# 3. Close the restored tree BEFORE it becomes the live one.
+If `composer install` cannot run at all — no network, packagist unreachable —
+the last resort is a copy of `vendor/` from `~/five_store`, and then **only**
+if the gate in 9.0.2 passes on it. A copy that the gate rejects is not a
+rollback, it is a second outage.
+
+If images were lost rather than merely stale, restore them from their own
+backup instead of step 3's copy:
+
+```sh
+tar -xzf ~/backups/storage-$STAMP.tar.gz -C "$RESTORE"
+```
+
+Then close the restored tree and swap it in:
+
+```sh
 (cd "$RESTORE" && php artisan down --retry=30)
 test -f "$RESTORE/storage/framework/maintenance.php" && echo "restored tree is closed"
 
-# 4. Swap. The maintenance flag travels with it, so the site never reopens.
 rm -rf ~/five_store_broken
 mv ~/five_store ~/five_store_broken
 mv "$RESTORE" ~/five_store
 
 cd ~/five_store
 test -f storage/framework/maintenance.php && echo "still closed after the swap"
-ls -l public/storage >/dev/null 2>&1 || php artisan storage:link
+php artisan storage:link
 ```
 
-If images were lost rather than merely stale, restore them from their own
-backup instead of step 2's copy:
+### 9.0.2 Prove the restored release runs, and only then reopen
 
-```sh
-tar -xzf ~/backups/storage-$STAMP.tar.gz -C ~/five_store
-```
-
-### 9.0.1 Rebuild caches, verify, and only then reopen
+The site is still closed. Nothing below reopens it until every check has
+passed.
 
 ```sh
 cd ~/five_store
+
+# 1. The dependencies are complete — checked against composer.lock, not assumed
+#    from the exit code of cp or composer.
+php ~/vendor-check.php ~/five_store      # the script from section 6.3
+echo "gate exit: $?"                     # must be 0
+
+# 2. The framework actually boots.
+php artisan --version                    # must print "Laravel Framework 13.x"
+
+# 3. Only now rebuild the caches. Doing this before step 2 caches a broken
+#    application and hides the failure behind a stale config.
 php artisan config:cache && php artisan route:cache && php artisan view:cache
-```
 
-Run the checks in section 6.4 **while the site is still closed**, and confirm
-the catalog counts match the pre-deploy backup:
-
-```sh
+# 4. The application answers, and the data is intact.
+php artisan about --only=environment
 php artisan tinker --execute="
+echo 'db         : '.DB::connection()->getDatabaseName().PHP_EOL;
 echo 'categories : '.App\Models\Category::count().PHP_EOL;
 echo 'products   : '.App\Models\Product::count().PHP_EOL;
 echo 'images     : '.App\Models\ProductImage::count().PHP_EOL;
 echo 'image files: '.count(Storage::disk(config('catalog.images.disk'))->allFiles('products')).PHP_EOL;"
 ```
 
-Only once those pass:
+The counts must match what section 8a recorded before the deploy. Then run the
+rest of the section 6.6 checks. Only once all of them pass:
 
 ```sh
 php artisan up
 curl -s -o /dev/null -w '%{http_code}\n' https://fivestore.alwaysdata.net/   # expect 302
 ```
 
-Keep `~/five_store_broken` until the restored site has been checked properly;
-it holds the logs that explain what went wrong.
+If any check fails, the site stays closed. That is the correct outcome: a
+maintenance page is recoverable, a half-restored shop is not.
 
-### 9.0.2 Tested
+### 9.0.3 Tested
 
-The whole sequence was run in an isolated copy of the application, with the
-real `artisan` binary and a section-3-style backup taken before `down`:
+Run against an isolated copy of this application — the real `vendor/` (113
+packages after `--no-dev`), the real `artisan`, and a section-3.2 backup taken
+before the window.
+
+A failing `composer install` was reproduced the way composer actually fails:
+three package directories (`symfony/console`, `nesbot/carbon`,
+`league/flysystem`) removed while `vendor/composer/installed.php` still listed
+them, which is the state an interrupted run leaves behind.
 
 ```
-backup archive contains maintenance.php      : 0   (expected - taken before the window)
+baseline live vendor                         : 14611 files, fingerprint b587430593f02a8a
 
-OLD sequence (restore straight over the live path):
-  mv five_store five_store_broken
-  tar -xzf backup-app.tar.gz
-  -> maintenance.php in restored tree        : *** MISSING ***
-  -> app reports                             : "absent -> site is LIVE to visitors"
-  -> the flag was still in the moved-aside tree
+composer install fails in the STAGING directory (this plan):
+  staging gate                               : FAIL  (3 listed but directory missing)
+  staging boots                              : no
+  live vendor files                          : 14611  (unchanged)
+  live vendor byte-for-byte identical        : YES
+  live gate                                  : PASS
+  live boots                                 : Laravel Framework 13.38.0
+  site state                                 : LIVE - the window was never opened
+  after deleting the staging dir and retrying: PASS
 
-NEW sequence (assemble outside, close, then swap):
-  extracted 503 files into five_store_restore
-  carried over .env, vendor, storage/app/public
-  artisan down on the restored tree
-  swapped into place
-  -> maintenance.php in live tree            : PRESENT
-  -> app reports                             : "DOWN (visitors see maintenance)"
-  -> artisan up                              : "LIVE (reopened)"
+composer install fails in the LIVE tree (what the previous plan did):
+  live gate                                  : FAIL
+  live boots                                 : no
+  rollback copies vendor from the live tree:
+    cp -a exit code                          : 0      <- reports success
+    restored release gate                    : FAIL
+    restored release boots                   : no
 
-Image carry-over, checked separately:
-  images in live tree                        : 3
-  storage/app/public entries in the backup   : 0   (excluded on purpose)
-  restored tree before carry-over            : 0
-  restored tree after carry-over             : 3
-  contents identical                         : yes
+same rollback, vendor taken from the untouched previous release:
+  restored release gate                      : PASS   <- checked, not assumed
+  restored release boots                     : Laravel Framework 13.38.0
+  product images carried over                : 3 of 3
+  restored tree closed before the swap       : DOWN
+  after the swap                             : DOWN, gate PASS, boots 13.38.0
+  only then, artisan up                      : LIVE
 ```
+
+And the deleted-file problem, on the same copy:
+
+```
+extracting the release over the live tree (the previous step 6.2):
+  database/seeders/CatalogSeeder.php         : *** STILL PRESENT ***
+  CatalogSeeder.php inside the archive       : no
+
+building a clean release directory (step 6.1):
+  database/seeders/CatalogSeeder.php         : absent
+  seeders present    : DatabaseSeeder.php  RealisticCatalogSeeder.php  data
+  .env carried over  : yes
+  images carried over: 3 of 3
+  dev telemetry files shipped                : 0
+  new tree boots                             : Laravel Framework 13.38.0
+```
+
+Finally, the commands in 6.1 and 6.3 were extracted from this file and run as
+written — not paraphrased — against the archives section 5.1 actually produced
+(`20261028-044556-0fc4392c`):
+
+```
+section 6.1, clean directory from the real archives:
+  manifest hash on disk                      : 5573e3afcf48d5a3
+  manifest hash recorded at build time       : 5573e3afcf48d5a3
+  database/seeders/CatalogSeeder.php         : absent
+  seeders present                            : DatabaseSeeder.php RealisticCatalogSeeder.php data
+  bootstrap/cache/ contents                  : .gitignore   (no dev-built manifest)
+  storage/inertia-devtools/                  : absent
+  release boots                              : Laravel Framework 13.38.0
+
+section 6.3, the gate script as written in this file:
+  against a complete vendor  -> "vendor matches composer.lock", exit 0
+  against symfony/console removed:
+     listed but directory missing/empty      : 1
+     BAD symfony/console
+     VENDOR CHECK FAILED                     , exit 1
+```
+
+A check that cannot fail is not a check; both directions were exercised.
 
 ### 9.1 Rolling back the price migration destroys every price
 
@@ -908,14 +1193,20 @@ deployment must not proceed until a good one exists.
 | 3 | Assets and code out of step, so pages reference missing chunks | Medium | Build and upload in the same pass (sections 4–5); manifest checked before upload |
 | 4 | Migration runs while traffic is served | Low | `php artisan down` around the step; the `ALTER` is fast on a small table |
 | 5 | Image fetcher reaching the network from production | None in normal use | It is only called by the seeder, which does not run there |
-| 6 | Boost's dev dependency reaching production | Low | `composer install --no-dev` excludes it; confirm with `composer show laravel/boost` returning nothing on the server |
+| 6 | Boost's dev dependency reaching production | Low | `composer install --no-dev` excludes it; the locally built `bootstrap/cache/packages.php` that names it is excluded from the archive (5.1) and regenerated on the server (6.2); confirm with `composer show laravel/boost` returning nothing |
+| 7 | A file deleted from Git survives on the server and stays loadable | Medium | The release is built in a clean directory and swapped in (6.1, 6.4), so the tree holds only what the archive holds; checked explicitly for `CatalogSeeder.php` |
+| 8 | `composer install` fails partway and leaves `vendor/` incomplete | Medium | It runs in the staging directory, never in a live release (6.2); completeness is checked against `composer.lock` rather than inferred from an exit code (6.3, 9.0.2) |
+| 9 | A rollback restores an incomplete `vendor/` and the site stays down | Medium | 9.0 swaps back the previous release directory, whose `vendor/` nothing wrote to; the same gate runs again before `artisan up` (9.0.2) |
 
 ---
 
 ## 11. Decisions to confirm before running this
 
-1. **Deploy window** — the maintenance window in section 6 is under a minute,
-   but it is still downtime.
+1. **Deploy window** — the maintenance window is section 6.4 to 6.7 only.
+   Extracting the release and running `composer install` now happen beforehand,
+   in a staging directory, while the old release keeps serving; what remains
+   inside the window is an image copy, two `mv`s, one `ALTER TABLE` and the
+   caches. It is still downtime.
 2. **Production content** — section 8b. The catalog is empty and stays empty
    until someone enters real products through `/admin`. Either complete that
    checklist before announcing the shop, or record that launching empty was
@@ -958,10 +1249,22 @@ ls -lh ~/releases
 #    (needs the credentials, so run it BEFORE step 1 if you want to check)
 #    mysql --defaults-extra-file=/tmp/.dbcnf -e "SHOW DATABASES LIKE 'fivestore_%';"
 
-# 4. Confirm no working copies of the application are left in the home
-#    directory beyond the live one and, at most, one previous release.
+# 4. Confirm what is left in the home directory: the live release, and the
+#    previous one kept for rollback. No staging directory should remain.
 ls -ld ~/five_store*
+#    expected: five_store, five_store_prev-<release>
+#    five_store_next-* means a staging build was abandoned - remove it
+#    five_store_broken  is a failed release kept for its logs - remove when read
+
+# 5. The vendor check script from section 6.3 is no longer needed.
+rm -f ~/vendor-check.php
 ```
+
+**Keep `~/five_store_prev-$RELEASE` until the next deployment.** It is the
+rollback path in section 9.0, and the only copy of the previous release's
+`vendor/` that is known to be complete. Removing it does not break the
+rollback, but it downgrades it from a two-command swap to rebuilding the
+dependencies from `composer.lock` (section 9.0.1).
 
 Backups in `~/backups` are **not** removed here. They stay until the retention
 policy says otherwise, and `prices-*.tsv` in particular is the only artifact
