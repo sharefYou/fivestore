@@ -833,49 +833,80 @@ installs into the staging directory, never into a live release, so no failed
 release directory**, so the flag does not survive a swap. The previous release
 is therefore closed before it is moved back, not after.
 
-**The whole procedure is one `if`/`else`,** so that pasting it in a single
-block is safe: if the previous release is not usable, nothing inside runs at
-all.
+**The whole procedure is one function,** like 9.0.1, so that every step is a
+precondition for the next: the first failure returns, and the live release is
+moved only once every check has passed.
 
 ```sh
-RELEASE=<the id from section 5>
-PREV="$HOME/five_store_prev-$RELEASE"
+rollback_to_previous_release() {
+    RELEASE=<the id from section 5>
+    PREV="$HOME/five_store_prev-$RELEASE"
+    BROKEN="$HOME/five_store_broken-$(date +%Y%m%d-%H%M%S)"
 
-# --- Precondition. Everything below depends on it. -------------------------
-if ! confirm_site_closed; then
-    echo "      Run nothing further in 9.0 until the site answers 503."
-elif [ ! -d "$PREV" ] || [ ! -f "$PREV/artisan" ] || [ ! -f "$PREV/vendor/autoload.php" ]; then
-    echo "STOP: no usable previous release at $PREV"
-    echo "      Run nothing further in 9.0. Go to section 9.0.1."
-else
-    # Carry over the things that belong to the server, not to a release.
-    cp -a ~/five_store/.env "$PREV/.env"
-    mkdir -p "$PREV/storage/app/public" "$PREV/storage/app/private"
-    cp -a ~/five_store/storage/app/public/. "$PREV/storage/app/public/"
+    confirm_site_closed || return 1
 
-    ls ~/five_store/storage/app/public/products | wc -l     # these two numbers
-    ls "$PREV"/storage/app/public/products      | wc -l     # must match
+    [ -d "$PREV" ] && [ -f "$PREV/artisan" ] && [ -f "$PREV/vendor/autoload.php" ] || {
+        echo "STOP: no usable previous release at $PREV"
+        echo "      Run nothing further in 9.0. Go to section 9.0.1."; return 1; }
 
-    # The private disk, under the rule in 6.4: checked, copied, never silenced.
+    [ -e "$BROKEN" ] && { echo "STOP: $BROKEN already exists"; return 1; }
+
+    # 1. Carry over what belongs to the server rather than to a release.
+    #    `cp` returning 0 is not the same as the file being there: if the
+    #    destination happens to be a directory, `cp -a src dir` copies *into*
+    #    it and still exits 0. Compare the result instead.
+    cp -a ~/five_store/.env "$PREV/.env" || {
+        echo "STOP: .env was not carried over — nothing was swapped"; return 1; }
+    cmp -s ~/five_store/.env "$PREV/.env" || {
+        echo "STOP: $PREV/.env is not a copy of the live .env — nothing was swapped"; return 1; }
+
+    mkdir -p "$PREV/storage/app/public" "$PREV/storage/app/private" || {
+        echo "STOP: could not create the storage directories in $PREV"; return 1; }
+    cp -a ~/five_store/storage/app/public/. "$PREV/storage/app/public/" || {
+        echo "STOP: the product images were not carried over — nothing was swapped"; return 1; }
+
+    #    Every file on the live disk must now exist in the previous release.
+    missing=$(cd ~/five_store/storage/app/public && find . -type f | while read -r f; do
+        [ -f "$PREV/storage/app/public/$f" ] || echo "$f"; done | wc -l)
+    [ "$missing" -eq 0 ] || {
+        echo "STOP: $missing file(s) on the live disk did not reach $PREV"; return 1; }
+    echo "images carried over: $(find "$PREV/storage/app/public" -type f | wc -l) file(s), none missing"
+
     PRIV=~/five_store/storage/app/private
     if [ -d "$PRIV" ]; then
         find "$PRIV" -mindepth 1 -maxdepth 1 -not -name livewire-tmp -not -name .gitignore
-        cp -a "$PRIV/." "$PREV/storage/app/private/"
+        cp -a "$PRIV/." "$PREV/storage/app/private/" || {
+            echo "STOP: the private disk was not carried over — nothing was swapped"; return 1; }
     fi
 
-    # Close it before it becomes the live one.
-    (cd "$PREV" && php artisan down --retry=30)
-    test -f "$PREV/storage/framework/maintenance.php" && echo "previous release is closed"
+    # 2. Close it before it becomes the live one, and prove the flag is on disk.
+    (cd "$PREV" && php artisan down --retry=30) || {
+        echo "STOP: artisan down failed in $PREV — nothing was swapped"; return 1; }
+    test -f "$PREV/storage/framework/maintenance.php" || {
+        echo "STOP: maintenance mode did not engage in $PREV — nothing was swapped"; return 1; }
+    echo "previous release is closed"
 
-    rm -rf ~/five_store_broken
-    mv ~/five_store ~/five_store_broken
-    mv "$PREV" ~/five_store
+    # 3. Only now is anything moved, and nothing is deleted.
+    mv ~/five_store "$BROKEN" || {
+        echo "STOP: could not move the live release aside — nothing was swapped"; return 1; }
+    mv "$PREV" ~/five_store || {
+        echo "CRITICAL: the failed release is at $BROKEN and the swap did not complete."
+        echo "          The site is closed. Put it back by hand:"
+        echo "          mv $BROKEN ~/five_store"
+        return 1; }
 
-    cd ~/five_store
-    test -f storage/framework/maintenance.php && echo "still closed after the swap"
-    php artisan storage:link --force    # the tree carries a link from its own deploy
-    echo "swap complete — continue at 9.0.2"
-fi
+    cd ~/five_store || return 1
+    test -f storage/framework/maintenance.php || {
+        echo "CRITICAL: the maintenance flag did not survive the swap — the site may be"
+        echo "          open on an unverified release. Run: php artisan down --retry=30"
+        return 1; }
+    echo "still closed after the swap"
+    php artisan storage:link --force      # the tree carries a link from its own deploy
+    echo "swap complete — the failed release is kept at $BROKEN"
+    echo "continue at 9.0.2"
+}
+
+rollback_to_previous_release || echo "ROLLBACK ABORTED — read the STOP line above."
 ```
 
 **Why the precondition is a branch and not a warning.** An earlier version of
@@ -889,8 +920,22 @@ directory as the live site — turning a recoverable failed deployment into a
 destroyed one. The test also covers a directory that exists but has been
 gutted, which a bare `-d` would have accepted.
 
-Keep `~/five_store_broken` until the restored site has been checked properly; it
-holds the logs that explain what went wrong.
+**Why the images are compared file by file, not by count.** The previous
+release holds the images as they stood when it was live, and `cp -a` merges
+rather than mirrors. If an administrator deleted an image after the deploy, the
+previous release still has it and a count comparison would stop a rollback that
+is perfectly sound. What actually matters is the other direction: nothing on
+the live disk may be absent from the tree about to replace it.
+
+**Why the failed release gets a timestamped directory.** `rm -rf
+~/five_store_broken` used to run first, which would have destroyed the evidence
+from an earlier failed attempt — exactly the logs needed to explain why the
+first rollback was necessary. `$BROKEN` now carries the time of the rollback,
+so each attempt keeps its own, and the procedure stops rather than overwrite
+one that somehow already exists.
+
+Keep those directories until the restored site has been checked properly; they
+hold the logs that explain what went wrong. Section 12 lists them.
 
 Go to 9.0.2 before reopening.
 
@@ -932,6 +977,8 @@ rollback_from_backup() {
     #    the application and needs it.
     cp -a ~/five_store/.env "$RESTORE/.env" || {
         echo "STOP: .env was not carried over"; return 1; }
+    cmp -s ~/five_store/.env "$RESTORE/.env" || {
+        echo "STOP: $RESTORE/.env is not a copy of the live .env"; return 1; }
 
     # 3. Rebuild the dependencies from the composer.lock that came out of the
     #    backup — the previous release's own lock, not the new one's.
@@ -966,13 +1013,18 @@ rollback_from_backup() {
     test -f "$RESTORE/storage/framework/maintenance.php" || {
         echo "STOP: maintenance mode did not engage in $RESTORE — nothing was swapped"; return 1; }
 
-    # 7. Only now is anything moved.
-    rm -rf ~/five_store_broken
-    mv ~/five_store ~/five_store_broken || {
-        echo "STOP: could not move the live release aside"; return 1; }
+    # 7. Only now is anything moved, and nothing is deleted: the failed
+    #    release keeps a directory of its own, named for the time of this
+    #    rollback, so an earlier attempt's logs survive.
+    BROKEN="$HOME/five_store_broken-$(date +%Y%m%d-%H%M%S)"
+    [ -e "$BROKEN" ] && { echo "STOP: $BROKEN already exists"; return 1; }
+
+    mv ~/five_store "$BROKEN" || {
+        echo "STOP: could not move the live release aside — nothing was swapped"; return 1; }
     mv "$RESTORE" ~/five_store || {
-        echo "CRITICAL: the live release is at ~/five_store_broken and the swap failed."
-        echo "          Put it back by hand: mv ~/five_store_broken ~/five_store"
+        echo "CRITICAL: the failed release is at $BROKEN and the swap did not complete."
+        echo "          The site is closed. Put it back by hand:"
+        echo "          mv $BROKEN ~/five_store"
         return 1; }
 
     cd ~/five_store || return 1
@@ -981,7 +1033,8 @@ rollback_from_backup() {
         echo "          with an unverified release. Run: php artisan down --retry=30"
         return 1; }
     php artisan storage:link --force      # the tree carries a link from its own deploy
-    echo "swap complete — continue at 9.0.2"
+    echo "swap complete — the failed release is kept at $BROKEN"
+    echo "continue at 9.0.2"
 }
 
 rollback_from_backup || echo "ROLLBACK ABORTED — read the STOP line above."
@@ -1257,6 +1310,61 @@ reproduces the two states a failed install leaves behind, and for the
 maintenance cases `artisan` was replaced by one that reports success without
 writing the file. Everything else — the backup archive, the dependency tree,
 `vendor-check.php`, and both functions — was the real thing.
+
+**9.0, step by step.** Same method again: the function extracted from this file
+and run as written, against a live "broken" release holding the `.env`, six
+product images and one category image, and a `$PREV` that is a complete
+`--no-dev` release (113 packages).
+
+```
+.env cannot be written (its destination is a directory):
+  STOP: $PREV/.env is not a copy of the live .env - nothing was swapped
+  live release untouched (fingerprint)  : YES     images 7 of 7
+  still closed to visitors              : DOWN
+  $PREV put into maintenance            : no
+  five_store_broken-* created           : 0
+
+the storage directories cannot be created:
+  STOP: could not create the storage directories in $PREV
+  live release untouched (fingerprint)  : YES     images 7 of 7
+  still closed                          : DOWN    broken dirs created: 0
+
+503 passes but artisan down fails in $PREV:
+  STOP: artisan down failed in $PREV - nothing was swapped
+  live release untouched (fingerprint)  : YES     images 7 of 7
+  still closed                          : DOWN    broken dirs created: 0
+
+the normal path, end to end:
+  images carried over                   : 8 file(s), none missing
+  live tree is the previous release     : yes
+  it boots                              : Laravel Framework 13.38.0
+  .env is a regular file and matches    : yes
+  private disk carried over             : yes
+  closed before the swap, still closed after it
+  failed release kept at                : five_store_broken-20261028-063539
+  its contents preserved                : yes
+
+a five_store_broken-* directory already exists:
+  existing dir, 12 files incl. INVESTIGATION_NOTES.txt
+  after a second rollback:
+    earlier directory still present     : yes
+    its notes survived                  : yes
+    its file count                      : 12 (unchanged)
+    broken directories now              : 2, each with its own timestamp
+```
+
+The normal-path case is also what justifies comparing the images file by file:
+`$PREV` held **8** image files to the live disk's **7**, because one had been
+deleted through `/admin` after the deploy. A count comparison would have
+stopped a rollback that was entirely sound; the check that matters — nothing on
+the live disk missing from the tree about to replace it — passed.
+
+One of these cases found a defect in the first version of this section. `cp -a
+~/five_store/.env "$PREV/.env"` **exited 0** when the destination was a
+directory, because `cp -a src dir` copies *into* `dir`; the guard never fired
+and the swap went ahead without a usable `.env`. The `cmp -s` that follows the
+copy is there because of it, and the same check was added to 9.0.1. An exit
+code describes the command, not the result.
 
 ### 9.1 Rolling back the price migration destroys every price
 
@@ -1545,8 +1653,9 @@ ls -lh ~/releases
 #    previous one kept for rollback. No staging directory should remain.
 ls -ld ~/five_store*
 #    expected: five_store, five_store_prev-<release>
-#    five_store_next-* means a staging build was abandoned - remove it
-#    five_store_broken  is a failed release kept for its logs - remove when read
+#    five_store_next-*   means a staging build was abandoned - remove it
+#    five_store_broken-* is a failed release kept for its logs. Each rollback
+#                        makes its own; read them before removing any.
 
 # 5. The vendor check script from section 6.3 is no longer needed.
 rm -f ~/vendor-check.php
